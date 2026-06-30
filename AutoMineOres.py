@@ -1,4 +1,5 @@
 # meta developer: @Wers1xx
+# meta pic: https://x0.at/3Wu7.jpg
 # requires: 
 
 import asyncio
