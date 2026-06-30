@@ -1,5 +1,5 @@
 # meta developer: @WersMod
-# meta pic: https://example.com/icon.png
+# meta pic: https://x0.at/3Wu7.jpg
 # meta banner: https://example.com/banner.png
 # scope: hikka_only
 # scope: hikka_min 1.2.10
