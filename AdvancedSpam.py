@@ -1,5 +1,5 @@
 # meta developer: @Wers1xx
-
+# meta pic: https://x0.at/3Wu7.jpg
 # name: AdvancedSpam
 # description: Модуль для спам-рассылки с полным контролем
 
