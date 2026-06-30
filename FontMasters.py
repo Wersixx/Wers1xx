@@ -1,6 +1,6 @@
 # meta developer: @Wers1xx
-# meta pic: https://img.icons8.com/color/96/000000/font-size.png
-# meta banner: https://img.icons8.com/color/480/000000/fonts.png
+# meta pic: https://x0.at/3Wu7.jpg
+# meta banner: https://x0.at/3Wu7.jpg
 # scope: hikka_only
 # scope: hikka_min 1.6.0
 
