@@ -1,5 +1,5 @@
 # meta developer: @Wers1xx
-# meta pic: https://i.imgur.com/your_icon.png
+# meta pic: https://x0.at/3Wu7.jpg
 # scope: hikka_only
 # scope: hikka_min 1.6.2
 
