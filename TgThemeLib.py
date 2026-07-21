@@ -47,6 +47,19 @@ class ThemeLib(loader.Library):
             f"{int(b1 * (1 - ratio) + b2 * ratio):02x}"
         )
 
+    def theme_wallpaper(self, img, max_size=1920):
+        """Convert image to wallpaper format for theme"""
+        output = io.BytesIO()
+        img_copy = img.copy()
+        if max(img_copy.size) > max_size:
+            scale = max_size / max(img_copy.size)
+            img_copy = img_copy.resize(
+                (int(img_copy.size[0] * scale), int(img_copy.size[1] * scale)),
+                Image.LANCZOS
+            )
+        img_copy.save(output, format='JPEG', quality=85, optimize=True)
+        return output.getvalue()
+
     def build_theme(self, bg_color, text_color, accent_color, alpha="ff"):
         tr = lambda c, a: f"#{a}{bg_color if c == 'f' else text_color if c == 't' else accent_color}"
         dsel = f"#{alpha}{self.blend(bg_color, accent_color, 0.25)}"
@@ -725,22 +738,6 @@ class ThemeLib(loader.Library):
             f"voipgroup_overlayAlertMutedByAdmin2=#{accent_color}\n"
             f"voipgroup_overlayBlue1=#{accent_color}\n"
             f"voipgroup_overlayBlue2=#{accent_color}\n"
-            f"voipgroup_overlayGreen1=#{accent_color}\n"
-            f"voipgroup_overlayGreen2=#{accent_color}\n"
-            f"voipgroup_rtmpButton=#{accent_color}\n"
-            f"voipgroup_scrollUp=#{accent_color}\n"
-            f"voipgroup_searchBackground=#{accent_color}\n"
-            f"voipgroup_searchPlaceholder=#{text_color}\n"
-            f"voipgroup_searchText=#{text_color}\n"
-            f"voipgroup_soundButton=#{accent_color}\n"
-            f"voipgroup_soundButton2=#{accent_color}\n"
-            f"voipgroup_soundButtonActive=#{accent_color}\n"
-            f"voipgroup_soundButtonActive2=#{accent_color}\n"
-            f"voipgroup_soundButtonActive2Scrolled=#{accent_color}\n"
-            f"voipgroup_soundButtonActiveScrolled=#{accent_color}\n"
-            f"voipgroup_speakingText=#{text_color}\n"
-            f"voipgroup_topPanelBlue1=#{accent_color}\n"
-            f"voipgroup_topPanelBlue2=#{accent_color}\n"
             f"voipgroup_topPanelGray=#{accent_color}\n"
             f"voipgroup_topPanelGreen1=#{accent_color}\n"
             f"voipgroup_topPanelGreen2=#{accent_color}\n"
@@ -807,39 +804,40 @@ class ThemeLib(loader.Library):
         )
 
     def process_photo(self, photo_bytes: bytes, alpha_hex: str = "ff") -> bytes:
-    img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+        # ВСЕ СТРОКИ ВНУТРИ ЭТОЙ ФУНКЦИИ ИМЕЮТ ОТСТУП (4 ПРОБЕЛА)
+        img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
 
-    bg, _, accent = self.extract_colors(img)
+        bg, _, accent = self.extract_colors(img)
 
-    r = int(bg[0:2], 16)
-    g = int(bg[2:4], 16)
-    b = int(bg[4:6], 16)
+        r = int(bg[0:2], 16)
+        g = int(bg[2:4], 16)
+        b = int(bg[4:6], 16)
 
-    brightness = r * 0.299 + g * 0.587 + b * 0.114
+        brightness = r * 0.299 + g * 0.587 + b * 0.114
 
-    if brightness > 170:
-        text = "1b1b1b"
-    else:
-        text = "ffffff"
-
-    ar = int(accent[0:2], 16)
-    ag = int(accent[2:4], 16)
-    ab = int(accent[4:6], 16)
-
-    abr = ar * 0.299 + ag * 0.587 + ab * 0.114
-
-    if abs(brightness - abr) < 40:
         if brightness > 170:
-            accent = self.darken(accent, 0.45)
+            text = "1b1b1b"
         else:
-            accent = self.blend(accent, "ffffff", 0.45)
+            text = "ffffff"
 
-    theme = self.build_theme(bg, text, accent, alpha_hex)
-    wallpaper = self.theme_wallpaper(img)
+        ar = int(accent[0:2], 16)
+        ag = int(accent[2:4], 16)
+        ab = int(accent[4:6], 16)
 
-    return (
-        theme.encode("utf-8")
-        + b"\n\nWPS\n"
-        + wallpaper
-        + b"\nWPE\n"
-    )
+        abr = ar * 0.299 + ag * 0.587 + ab * 0.114
+
+        if abs(brightness - abr) < 40:
+            if brightness > 170:
+                accent = self.darken(accent, 0.45)
+            else:
+                accent = self.blend(accent, "ffffff", 0.45)
+
+        theme = self.build_theme(bg, text, accent, alpha_hex)
+        wallpaper = self.theme_wallpaper(img)
+
+        return (
+            theme.encode("utf-8")
+            + b"\n\nWPS\n"
+            + wallpaper
+            + b"\nWPE\n"
+        )
