@@ -38,16 +38,40 @@ class WersMusicMod(loader.Module):
         except Exception:
             pass
 
+    def _is_service_button(self, text: str) -> bool:
+        """Проверяет, является ли кнопка служебной (не треком)"""
+        if not text:
+            return True
+        t = text.strip().lower()
+        # Только явно служебные кнопки
+        service_keywords = [
+            "назад", "вперед", "вперёд", "больше", "отмена", "закрыть",
+            "добавить", "подписа", "канал", "спасибо", "меню", "главная",
+            "page", "след", "пред", "cancel", "close", "back", "next",
+            "❌", "⬅️", "➡️", "◀️", "▶️"
+        ]
+        # Если кнопка состоит только из эмодзи/точек или содержит служебные слова
+        if len(t) <= 2 and not any(c.isalnum() for c in t):
+            return True
+        return any(k in t for k in service_keywords)
+
     @loader.command()
     async def wm(self, message):
         """<название> - Найти и скачать музыку / реплай на видео = Шазам"""
         args = utils.get_args_raw(message)
         reply = await message.get_reply_message()
 
-        # Режим Шазам: реплай на медиа без текста или с .wm
+        # Режим Шазам: реплай на медиа
         is_shazam = False
         media = None
-        if reply and (reply.video or reply.audio or reply.voice or reply.video_note or (reply.document and reply.document.mime_type and "video" in reply.document.mime_type)):
+        if reply and (
+            reply.video
+            or reply.audio
+            or reply.voice
+            or reply.video_note
+            or (reply.document and reply.document.mime_type and "video" in reply.document.mime_type)
+            or (reply.document and reply.document.mime_type and "audio" in reply.document.mime_type)
+        ):
             is_shazam = True
             media = reply.media
 
@@ -69,96 +93,153 @@ class WersMusicMod(loader.Module):
         try:
             async with self.client.conversation(bot, timeout=90) as conv:
                 if is_shazam and media:
-                    # Пересылаем медиа боту для распознавания
+                    # === РЕЖИМ ШАЗАМ ===
+                    # Отправляем медиа и ждём ИСКЛЮЧИТЕЛЬНО трек
                     await conv.send_file(media)
-                else:
-                    await conv.send_message(args)
 
-                resp = None
-                for _ in range(20):
-                    r = await conv.get_response()
-                    if r.text and any(e in r.text for e in ["⏳", "⌛", "Загрузка", "распозна"]):
+                    audio_msg = None
+                    for _ in range(40):  # дольше ждём, бот может распознавать
+                        try:
+                            r = await conv.get_response(timeout=3)
+                        except asyncio.TimeoutError:
+                            # Если таймаут — проверяем последние сообщения вручную
+                            messages = await self.client.get_messages(bot, limit=5)
+                            for msg in messages:
+                                if msg.media and (msg.audio or (msg.document and msg.document.mime_type and "audio" in msg.document.mime_type)):
+                                    audio_msg = msg
+                                    break
+                            if audio_msg:
+                                break
+                            continue
+
+                        # Игнорируем всё, кроме готового трека
+                        if r.media and (r.audio or (r.document and r.document.mime_type and "audio" in r.document.mime_type)):
+                            audio_msg = r
+                            break
+
+                        # Если бот пишет "загрузка/распознавание" — просто продолжаем ждать
+                        if r.text and any(x in r.text.lower() for x in ["⏳", "⌛", "загрузка", "распозна", "ищу", "обрабатываю"]):
+                            try:
+                                await self.client.edit_message(status, self.strings["waiting"])
+                            except Exception:
+                                pass
+                            continue
+
+                        # Всё остальное (кнопки, тексты, видео и т.д.) — игнорируем
                         continue
-                    if r.buttons:
-                        resp = r
-                        break
-                    # Иногда бот сразу кидает аудио после шазама
-                    if r.media and (r.audio or r.document):
-                        # Прямо отправляем найденный трек
+
+                    if audio_msg and audio_msg.media:
                         try:
                             await self.client.edit_message(status, self.strings["uploading"])
                         except Exception:
                             pass
+
                         await self.client.send_file(
                             message.chat_id,
-                            r.media,
-                            reply_to=reply.id if reply else message.id
+                            audio_msg.media,
+                            reply_to=reply.id if reply else message.id,
                         )
+
                         try:
                             await status.delete()
                         except Exception:
                             pass
+
                         await self._delete_bot_dialog(bot)
                         return
-                    await asyncio.sleep(0.4)
+                    else:
+                        await utils.answer(status, self.strings["no_results"])
+                        await self._delete_bot_dialog(bot)
+                        return
 
-                if not resp:
-                    await utils.answer(status, self.strings["no_results"])
-                    await self._delete_bot_dialog(bot)
-                    return
+                else:
+                    # === ОБЫЧНЫЙ ПОИСК ПО НАЗВАНИЮ ===
+                    await conv.send_message(args)
 
-                # Проверка на запрос подписки
-                is_sub_req = False
-                for row in resp.buttons:
-                    for btn in row:
-                        if hasattr(btn, "text") and btn.text:
-                            t = btn.text.strip().lower()
-                            if any(k in t for k in ["подписа", "канал", "спас"]):
-                                is_sub_req = True
-                                break
-                    if is_sub_req:
-                        break
+                    resp = None
+                    for _ in range(20):
+                        r = await conv.get_response()
+                        if r.text and any(e in r.text for e in ["⏳", "⌛", "Загрузка", "распозна"]):
+                            continue
+                        if r.buttons:
+                            resp = r
+                            break
+                        # На всякий случай — если сразу пришёл трек
+                        if r.media and (r.audio or r.document):
+                            try:
+                                await self.client.edit_message(status, self.strings["uploading"])
+                            except Exception:
+                                pass
+                            await self.client.send_file(
+                                message.chat_id,
+                                r.media,
+                                reply_to=reply.id if reply else message.id,
+                            )
+                            try:
+                                await status.delete()
+                            except Exception:
+                                pass
+                            await self._delete_bot_dialog(bot)
+                            return
+                        await asyncio.sleep(0.3)
 
-                if is_sub_req:
-                    cid = f"{message.chat_id}_{message.id}"
+                    if not resp:
+                        await utils.answer(status, self.strings["no_results"])
+                        await self._delete_bot_dialog(bot)
+                        return
 
-                    sub_links = []
+                    # Проверка на запрос подписки
+                    is_sub_req = False
                     for row in resp.buttons:
                         for btn in row:
-                            if hasattr(btn, "url") and btn.url:
-                                sub_links.append(btn)
+                            if hasattr(btn, "text") and btn.text:
+                                t = btn.text.strip().lower()
+                                if any(k in t for k in ["подписа", "канал", "спас"]):
+                                    is_sub_req = True
+                                    break
+                        if is_sub_req:
+                            break
 
-                    self.cache[cid] = {
-                        "conv": conv,
-                        "status": status,
-                        "orig": message,
-                        "reply": reply,
-                        "bot": bot,
-                        "args": args,
-                        "resp": resp,
-                        "sub_links": sub_links,
-                        "is_shazam": is_shazam,
-                        "media": media,
-                    }
+                    if is_sub_req:
+                        cid = f"{message.chat_id}_{message.id}"
 
-                    buttons = []
-                    for btn in sub_links:
-                        buttons.append([{"text": f"📢 {btn.text}", "url": btn.url}])
+                        sub_links = []
+                        for row in resp.buttons:
+                            for btn in row:
+                                if hasattr(btn, "url") and btn.url:
+                                    sub_links.append(btn)
 
-                    buttons.append([
-                        {"text": "✅ Подписаться", "callback": self._create_sub_callback(cid)},
-                        {"text": "❌ Игнор", "callback": self._create_ignore_callback(cid)},
-                    ])
+                        self.cache[cid] = {
+                            "conv": conv,
+                            "status": status,
+                            "orig": message,
+                            "reply": reply,
+                            "bot": bot,
+                            "args": args,
+                            "resp": resp,
+                            "sub_links": sub_links,
+                            "is_shazam": False,
+                            "media": None,
+                        }
 
-                    await self.inline.form(
-                        text=self.strings["sub_required"],
-                        message=status,
-                        reply_markup=buttons,
-                        ttl=300,
-                    )
-                    return
+                        buttons = []
+                        for btn in sub_links:
+                            buttons.append([{"text": f"📢 {btn.text}", "url": btn.url}])
 
-                await self._process_tracks_response(resp, status, message, reply, bot, conv, args, is_shazam)
+                        buttons.append([
+                            {"text": "✅ Подписаться", "callback": self._create_sub_callback(cid)},
+                            {"text": "❌ Игнор", "callback": self._create_ignore_callback(cid)},
+                        ])
+
+                        await self.inline.form(
+                            text=self.strings["sub_required"],
+                            message=status,
+                            reply_markup=buttons,
+                            ttl=300,
+                        )
+                        return
+
+                    await self._process_tracks_response(resp, status, message, reply, bot, conv, args)
 
         except asyncio.TimeoutError:
             await utils.answer(status, self.strings["error"].format("Таймаут"))
@@ -173,38 +254,49 @@ class WersMusicMod(loader.Module):
             except Exception:
                 pass
 
-    async def _process_tracks_response(self, resp, status, message, reply, bot, conv, args, is_shazam=False):
+    async def _process_tracks_response(self, resp, status, message, reply, bot, conv, args):
+        """Собирает ВСЕ кнопки выбора треков (более мягкий фильтр)"""
         tracks = []
+        seen_titles = set()
+
         for row in resp.buttons:
             for btn in row:
                 if hasattr(btn, "text") and btn.text:
                     t = btn.text.strip()
-                    skip = ["❌", "Назад", "Вперед", "Больше", "🎵", ".", "Отмена", "Закрыть", "Добавить"]
-                    if t and not any(s in t for s in skip):
-                        tracks.append({"title": t, "btn": btn})
+                    if not t:
+                        continue
+                    # Пропускаем только явно служебные кнопки
+                    if self._is_service_button(t):
+                        continue
+                    # Убираем дубликаты
+                    title_key = t.lower()
+                    if title_key in seen_titles:
+                        continue
+                    seen_titles.add(title_key)
+                    tracks.append({"title": t, "btn": btn})
 
         if not tracks:
-            # Возможно бот сразу скинул файл после шазама
             await utils.answer(status, self.strings["no_results"])
             await self._delete_bot_dialog(bot)
             return
 
         cid = f"{message.chat_id}_{message.id}"
         self.cache[cid] = {
-            "tracks": tracks[:10],
+            "tracks": tracks,  # больше не режем до 10 — показываем все
             "conv": conv,
             "status": status,
             "orig": message,
             "reply": reply,
             "bot": bot,
             "args": args,
-            "is_shazam": is_shazam,
         }
 
         buttons = []
-        for i, t in enumerate(tracks[:10]):
+        for i, t in enumerate(tracks):
+            # Обрезаем только для отображения, но все кнопки сохраняем
+            display = t["title"][:48] if len(t["title"]) > 48 else t["title"]
             buttons.append([{
-                "text": f"{i + 1}. {t['title'][:40]}",
+                "text": f"{i + 1}. {display}",
                 "callback": self._create_callback(cid, i),
             }])
 
@@ -243,10 +335,7 @@ class WersMusicMod(loader.Module):
                             pass
 
                 # Заново отправляем запрос
-                if c.get("is_shazam") and c.get("media"):
-                    await c["conv"].send_file(c["media"])
-                else:
-                    await c["conv"].send_message(c["args"])
+                await c["conv"].send_message(c["args"])
 
                 resp = None
                 for _ in range(20):
@@ -277,7 +366,7 @@ class WersMusicMod(loader.Module):
                         await self._delete_bot_dialog(c["bot"])
                         self.cache.pop(cid, None)
                         return
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.3)
 
                 if not resp:
                     await self.client.edit_message(c["status"], self.strings["no_results"])
@@ -286,7 +375,7 @@ class WersMusicMod(loader.Module):
 
                 await call.delete()
                 await self._process_tracks_response(
-                    resp, c["status"], c["orig"], c["reply"], c["bot"], c["conv"], c["args"], c.get("is_shazam", False)
+                    resp, c["status"], c["orig"], c["reply"], c["bot"], c["conv"], c["args"]
                 )
 
             except Exception as e:
@@ -337,6 +426,10 @@ class WersMusicMod(loader.Module):
                 await call.answer(self.strings["expired"], alert=True)
                 return
 
+            if idx >= len(c["tracks"]):
+                await call.answer("Ошибка выбора", alert=True)
+                return
+
             track = c["tracks"][idx]
             await call.answer("✅ Выбрано", alert=False)
 
@@ -350,19 +443,21 @@ class WersMusicMod(loader.Module):
                 await asyncio.sleep(1)
 
                 audio_msg = None
-                for _ in range(35):
+                for _ in range(40):
                     await asyncio.sleep(0.5)
-                    messages = await self.client.get_messages(c["bot"], limit=3)
+                    messages = await self.client.get_messages(c["bot"], limit=5)
 
                     for msg in messages:
                         if msg.media:
-                            if msg.text and any(x in (msg.text or "") for x in ["Загрузка", "скачив", "⏳", "⌛"]):
+                            # Игнорируем сообщения с текстом загрузки
+                            if msg.text and any(x in (msg.text or "").lower() for x in ["загрузка", "скачив", "⏳", "⌛", "обрабатываю"]):
                                 try:
                                     await self.client.edit_message(c["status"], self.strings["waiting"])
                                 except Exception:
                                     pass
-                                break
-                            else:
+                                continue
+                            # Берём только аудио
+                            if msg.audio or (msg.document and msg.document.mime_type and "audio" in msg.document.mime_type):
                                 audio_msg = msg
                                 break
 
@@ -391,7 +486,6 @@ class WersMusicMod(loader.Module):
                     except Exception:
                         pass
 
-                    # Полностью удаляем диалог с ботом — никаких следов
                     await self._delete_bot_dialog(c["bot"])
                 else:
                     try:
