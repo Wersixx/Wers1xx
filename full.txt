@@ -1,3 +1,4 @@
+AdminTools
 AdvancedSpam
 AllInOneMod
 AnimeThemes
