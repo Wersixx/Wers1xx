@@ -1,4 +1,4 @@
-# meta developer: @Wersixx
+# meta developer: @Wers1xx
 # meta pic: https://img.icons8.com/fluency/96/container.png
 # meta banner: https://via.placeholder.com/1200x300.png?text=Container+Info
 
