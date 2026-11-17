@@ -5,6 +5,7 @@ AnimeThemes
 AutoBottles
 AutoDelivery
 AutoMineOres
+AutoRelations
 ChatStats
 ContainerInfo
 FontMasters
