@@ -16,11 +16,15 @@ from .. import loader, utils
 
 try:
     from PIL import ImageOps
-except Exception:
+except Exception:  # pragma: no cover
     ImageOps = None
 
 logger = logging.getLogger(__name__)
 
+
+# ======================================================================
+#                         ЦВЕТОВАЯ МАТЕМАТИКА
+# ======================================================================
 
 def _clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
@@ -36,10 +40,12 @@ def _lin(v):
 
 
 def _lum(c):
+    """Относительная яркость (WCAG)."""
     return 0.2126 * _lin(c[0]) + 0.7152 * _lin(c[1]) + 0.0722 * _lin(c[2])
 
 
 def _cr(a, b):
+    """Контраст двух цветов (WCAG, 1..21)."""
     la, lb = _lum(a), _lum(b)
     if la < lb:
         la, lb = lb, la
@@ -82,6 +88,10 @@ def _hdiff(a, b):
 
 
 def _fit(c, cons, prefer_light=True):
+    """
+    Подгоняет светлоту цвета (оттенок и насыщенность сохраняются), пока контраст
+    с каждым фоном из cons=[(фон, мин_контраст), ...] не станет достаточным.
+    """
     c = tuple(c)
 
     def ok(x):
@@ -104,7 +114,15 @@ def _fit(c, cons, prefer_light=True):
     )
 
 
+# ======================================================================
+#                       ИЗВЛЕЧЕНИЕ ПАЛИТРЫ ИЗ ФОТО
+# ======================================================================
+
 def _extract_palette(img, limit=32):
+    """
+    Медианное сечение (64 кластера) + слияние близких оттенков в пространстве Lab.
+    Возвращает кластеры, отсортированные по площади: rgb, вес, Lab, L, C, H.
+    """
     im = img.convert("RGB")
     im.thumbnail((256, 256))
     q = im.quantize(colors=64, method=0, dither=0)
@@ -142,6 +160,10 @@ def _extract_palette(img, limit=32):
     return merged[:limit]
 
 
+# ======================================================================
+#                 РОЛИ: ОДИН ЦВЕТ — ОДНА ФУНКЦИЯ В ИНТЕРФЕЙСЕ
+# ======================================================================
+
 def _build_palette(colors, force=None, grad=False):
     if not colors:
         rgb = (30, 30, 34)
@@ -157,6 +179,7 @@ def _build_palette(colors, force=None, grad=False):
     else:
         dark = mean_l < 55
 
+    # ---------- акценты: самые яркие и РАЗНЫЕ цвета фото ----------
     vivid = [c for c in colors if c["C"] >= 14 and 10 < c["L"] < 96]
     vivid.sort(key=lambda c: -(c["C"] * (c["w"] ** 0.35)))
     picked = []
@@ -181,7 +204,7 @@ def _build_palette(colors, force=None, grad=False):
     dom = colors[0]
     dh, dl, ds = _hls(dom["rgb"])
 
-    if len(acc) < 8:
+    if len(acc) < 8:  # фото бедное на цвета — достраиваем оттенки вокруг его цвета
         if acc:
             bh, bl, bs = _hls(acc[0])
         else:
@@ -200,10 +223,11 @@ def _build_palette(colors, force=None, grad=False):
             return max(cands, key=lambda c: c["C"] * (c["w"] ** 0.3))["rgb"]
         return _from_hls(synth_h, 0.6, avg_s)
 
-    danger0 = semantic(40, 25, 0.005)
-    success0 = semantic(140, 35, 0.37)
-    warning0 = semantic(78, 22, 0.10)
+    danger0 = semantic(40, 25, 0.005)    # красный
+    success0 = semantic(140, 35, 0.37)   # зелёный
+    warning0 = semantic(78, 22, 0.10)    # янтарный
 
+    # ---------- поверхности ----------
     if dom["C"] < 6:
         bh = _hls(acc[0])[0]
         s_bg = 0.12
@@ -234,6 +258,7 @@ def _build_palette(colors, force=None, grad=False):
                 [(b, 10.0) for b in surfaces], dark)
     subtext = _fit(_mix(text, bg, 0.40), [(b, 4.6) for b in surfaces], dark)
 
+    # все акценты читаются на поверхностях и при этом на них читается on_accent
     cons_acc = [(b, 4.5) for b in surfaces] + [(on_accent, 4.2)]
     A = [_fit(a, cons_acc, dark) for a in acc]
     danger = _fit(danger0, cons_acc, dark)
@@ -242,6 +267,7 @@ def _build_palette(colors, force=None, grad=False):
 
     link = _fit(_mix(A[0], text, 0.25), [(b, 5.0) for b in surfaces], dark)
 
+    # ---------- исходящие пузыри ----------
     ah, _, asat = _hls(A[0])
     out_bubble = _from_hls(ah, 0.27 if dark else 0.86, min(asat, 0.55 if dark else 0.75))
     out_backs = [out_bubble]
@@ -293,6 +319,16 @@ def _build_palette(colors, force=None, grad=False):
     }
     return roles, meta
 
+
+# ======================================================================
+#          КАРТА «КЛЮЧ ТЕМЫ → РОЛЬ» (каждый элемент интерфейса)
+#   формат:  ключ=роль          цвет без прозрачности
+#            ключ=роль@AA       фиксированная прозрачность (hex)
+#            ключ=роль@A        прозрачность, заданная пользователем
+#            ключ=#aarrggbb     готовый цвет
+#   Для chat_out* роли text/subtext/accent/link/... автоматически
+#   заменяются на out_* — они подогнаны под цвет исходящего пузыря.
+# ======================================================================
 
 SPEC = """actionBarActionModeDefault=action_bar@A
 actionBarActionModeDefaultIcon=text
@@ -1096,6 +1132,10 @@ def _render_theme(roles, alpha_hex, grad=False):
     return "\n".join(out) + "\n", len(out)
 
 
+# ======================================================================
+#                                МОДУЛЬ
+# ======================================================================
+
 @loader.tds
 class tgtheme(loader.Module):
     """Module that creates an android-theme from a photo: every photo color is used, every element is colored"""
@@ -1135,6 +1175,7 @@ class tgtheme(loader.Module):
     }
 
     def _theme_wallpaper(self, img, max_size=1920):
+        """Создаёт обои из изображения"""
         output = io.BytesIO()
         img_copy = img.copy()
         if img_copy.mode != "RGB":
