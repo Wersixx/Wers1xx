@@ -21,6 +21,7 @@ PremiumEmojiInfo
 ReadFiles
 StoryPoster
 TgTheme
+TgThemeIOS
 TgThemeLib
 TruckFarm
 WersAFK
