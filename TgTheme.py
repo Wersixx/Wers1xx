@@ -1,1035 +1,1224 @@
+# meta source: https://raw.githubusercontent.com/Wersixx/Wers1xx/main/TgTheme.py
 # requires: Pillow
 # meta developer: @H_SunMods, @WersModules
 # meta pic: https://r2.fakecrime.bio/uploads/47308ab9-6035-4e7d-bc96-6b58f864bb33.jpg
 # meta banner: https://r2.fakecrime.bio/uploads/47308ab9-6035-4e7d-bc96-6b58f864bb33.jpg
 # meta fhsdesc: Theme, Темы, Sunnex, SunnexGB, H_SunMods, Wersixx, Wers1xx, WersModules
 
+import asyncio
+import colorsys
 import io
 import logging
+import math
+
 from PIL import Image
 from .. import loader, utils
 
+try:
+    from PIL import ImageOps
+except Exception:  # pragma: no cover
+    ImageOps = None
+
 logger = logging.getLogger(__name__)
+
+
+# ======================================================================
+#                         ЦВЕТОВАЯ МАТЕМАТИКА
+# ======================================================================
+
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def _to_hex(c):
+    return "{:02x}{:02x}{:02x}".format(*[int(max(0, min(255, round(v)))) for v in c])
+
+
+def _lin(v):
+    v /= 255.0
+    return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+
+def _lum(c):
+    """Относительная яркость (WCAG)."""
+    return 0.2126 * _lin(c[0]) + 0.7152 * _lin(c[1]) + 0.0722 * _lin(c[2])
+
+
+def _cr(a, b):
+    """Контраст двух цветов (WCAG, 1..21)."""
+    la, lb = _lum(a), _lum(b)
+    if la < lb:
+        la, lb = lb, la
+    return (la + 0.05) / (lb + 0.05)
+
+
+def _mix(a, b, t):
+    return tuple(int(round(a[i] * (1 - t) + b[i] * t)) for i in range(3))
+
+
+def _hls(c):
+    return colorsys.rgb_to_hls(c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
+
+
+def _from_hls(h, l, s):
+    r, g, b = colorsys.hls_to_rgb(h % 1.0, _clamp(l), _clamp(s))
+    return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+
+def _lab(c):
+    r, g, b = _lin(c[0]), _lin(c[1]), _lin(c[2])
+    x = (0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047
+    y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+    z = (0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883
+
+    def f(t):
+        return t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116
+
+    fx, fy, fz = f(x), f(y), f(z)
+    return 116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)
+
+
+def _de(a, b):
+    return math.dist(a, b)
+
+
+def _hdiff(a, b):
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+def _fit(c, cons, prefer_light=True):
+    """
+    Подгоняет светлоту цвета (оттенок и насыщенность сохраняются), пока контраст
+    с каждым фоном из cons=[(фон, мин_контраст), ...] не станет достаточным.
+    """
+    c = tuple(c)
+
+    def ok(x):
+        return all(_cr(x, b) >= r for b, r in cons)
+
+    if ok(c):
+        return c
+    h, l, s = _hls(c)
+    order = (1, -1) if prefer_light else (-1, 1)
+    for i in range(1, 101):
+        for sgn in order:
+            l2 = l + sgn * i / 100.0
+            if 0.0 <= l2 <= 1.0:
+                x = _from_hls(h, l2, s)
+                if ok(x):
+                    return x
+    return max(
+        ((255, 255, 255), (0, 0, 0)),
+        key=lambda x: min(_cr(x, b) / r for b, r in cons),
+    )
+
+
+# ======================================================================
+#                       ИЗВЛЕЧЕНИЕ ПАЛИТРЫ ИЗ ФОТО
+# ======================================================================
+
+def _extract_palette(img, limit=32):
+    """
+    Медианное сечение (64 кластера) + слияние близких оттенков в пространстве Lab.
+    Возвращает кластеры, отсортированные по площади: rgb, вес, Lab, L, C, H.
+    """
+    im = img.convert("RGB")
+    im.thumbnail((256, 256))
+    q = im.quantize(colors=64, method=0, dither=0)
+    pal = q.getpalette() or []
+    total = float(im.size[0] * im.size[1]) or 1.0
+
+    items = []
+    for cnt, idx in (q.getcolors() or []):
+        rgb = tuple(pal[idx * 3: idx * 3 + 3])
+        if len(rgb) == 3:
+            items.append([rgb, cnt / total])
+    items.sort(key=lambda x: -x[1])
+
+    merged = []
+    for rgb, w in items:
+        lab = _lab(rgb)
+        for m in merged:
+            if _de(lab, m["lab"]) < 7:
+                tot = m["w"] + w
+                m["rgb"] = tuple(
+                    int(round((m["rgb"][i] * m["w"] + rgb[i] * w) / tot)) for i in range(3)
+                )
+                m["w"] = tot
+                m["lab"] = _lab(m["rgb"])
+                break
+        else:
+            merged.append({"rgb": rgb, "w": w, "lab": lab})
+
+    for m in merged:
+        L, a, b = m["lab"]
+        m["L"] = L
+        m["C"] = math.hypot(a, b)
+        m["H"] = math.degrees(math.atan2(b, a)) % 360
+    merged.sort(key=lambda m: -m["w"])
+    return merged[:limit]
+
+
+# ======================================================================
+#                 РОЛИ: ОДИН ЦВЕТ — ОДНА ФУНКЦИЯ В ИНТЕРФЕЙСЕ
+# ======================================================================
+
+def _build_palette(colors, force=None, grad=False):
+    if not colors:
+        rgb = (30, 30, 34)
+        L, a, b = _lab(rgb)
+        colors = [{"rgb": rgb, "w": 1.0, "lab": (L, a, b), "L": L, "C": 0.0, "H": 0.0}]
+
+    total = sum(c["w"] for c in colors) or 1.0
+    mean_l = sum(c["L"] * c["w"] for c in colors) / total
+    if force == "dark":
+        dark = True
+    elif force == "light":
+        dark = False
+    else:
+        dark = mean_l < 55
+
+    # ---------- акценты: самые яркие и РАЗНЫЕ цвета фото ----------
+    vivid = [c for c in colors if c["C"] >= 14 and 10 < c["L"] < 96]
+    vivid.sort(key=lambda c: -(c["C"] * (c["w"] ** 0.35)))
+    picked = []
+
+    def take(cands, min_h, min_de):
+        for c in cands:
+            if len(picked) >= 8:
+                return
+            if c in picked:
+                continue
+            if all(_hdiff(c["H"], p["H"]) >= min_h or _de(c["lab"], p["lab"]) >= min_de
+                   for p in picked):
+                picked.append(c)
+
+    take(vivid, 20, 35)
+    if len(picked) < 8:
+        take(vivid, 8, 20)
+    if len(picked) < 8:
+        take(vivid, 0, 10)
+    acc = [p["rgb"] for p in picked]
+
+    dom = colors[0]
+    dh, dl, ds = _hls(dom["rgb"])
+
+    if len(acc) < 8:  # фото бедное на цвета — достраиваем оттенки вокруг его цвета
+        if acc:
+            bh, bl, bs = _hls(acc[0])
+        else:
+            bh, bl, bs = dh, 0.6, max(ds, 0.06)
+        shifts = [0, 30, -30, 60, -60, 90, -90, 150]
+        while len(acc) < 8:
+            acc.append(_from_hls(bh + shifts[len(acc) % len(shifts)] / 360.0, bl, bs))
+
+    sats = [_hls(a)[2] for a in acc]
+    avg_s = _clamp(sum(sats) / len(sats), 0.45, 0.8)
+
+    def semantic(target_h, tol, synth_h):
+        cands = [c for c in colors
+                 if c["C"] >= 14 and 15 < c["L"] < 95 and _hdiff(c["H"], target_h) <= tol]
+        if cands:
+            return max(cands, key=lambda c: c["C"] * (c["w"] ** 0.3))["rgb"]
+        return _from_hls(synth_h, 0.6, avg_s)
+
+    danger0 = semantic(40, 25, 0.005)    # красный
+    success0 = semantic(140, 35, 0.37)   # зелёный
+    warning0 = semantic(78, 22, 0.10)    # янтарный
+
+    # ---------- поверхности ----------
+    if dom["C"] < 6:
+        bh = _hls(acc[0])[0]
+        s_bg = 0.12
+    else:
+        bh = dh
+        s_bg = min(ds, 0.55)
+
+    if dark:
+        bg = _from_hls(bh, 0.105, s_bg * 0.85)
+        bg_hi = _from_hls(bh, 0.150, s_bg * 0.80)
+        bg_lo = _from_hls(bh, 0.065, s_bg * 0.85)
+        panel = _mix(bg_hi, acc[0], 0.10)
+        in_bubble = _mix(_from_hls(bh, 0.17, s_bg * 0.8), acc[0], 0.06)
+        action_bar = bg_lo
+        on_accent = _from_hls(bh, 0.07, 0.35)
+    else:
+        bg = _from_hls(bh, 0.95, min(s_bg, 0.5))
+        bg_hi = _from_hls(bh, 0.99, min(s_bg, 0.5))
+        bg_lo = _from_hls(bh, 0.90, min(s_bg, 0.5))
+        panel = _mix(bg_lo, acc[0], 0.08)
+        in_bubble = _mix(_from_hls(bh, 0.99, min(s_bg, 0.5)), acc[0], 0.03)
+        action_bar = bg_hi
+        on_accent = _from_hls(bh, 0.985, 0.25)
+
+    surfaces = [bg, bg_hi, bg_lo, panel, in_bubble, action_bar]
+
+    text = _fit(_from_hls(bh, 0.96 if dark else 0.08, 0.3),
+                [(b, 10.0) for b in surfaces], dark)
+    subtext = _fit(_mix(text, bg, 0.40), [(b, 4.6) for b in surfaces], dark)
+
+    # все акценты читаются на поверхностях и при этом на них читается on_accent
+    cons_acc = [(b, 4.5) for b in surfaces] + [(on_accent, 4.2)]
+    A = [_fit(a, cons_acc, dark) for a in acc]
+    danger = _fit(danger0, cons_acc, dark)
+    success = _fit(success0, cons_acc, dark)
+    warning = _fit(warning0, cons_acc, dark)
+
+    link = _fit(_mix(A[0], text, 0.25), [(b, 5.0) for b in surfaces], dark)
+
+    # ---------- исходящие пузыри ----------
+    ah, _, asat = _hls(A[0])
+    out_bubble = _from_hls(ah, 0.27 if dark else 0.86, min(asat, 0.55 if dark else 0.75))
+    out_backs = [out_bubble]
+    roles_extra = {}
+    if grad:
+        g1h, _, g1s = _hls(A[1])
+        g2h, _, g2s = _hls(A[2])
+        gl = 0.27 if dark else 0.86
+        roles_extra["out_grad1"] = _from_hls(g1h, gl, min(g1s, 0.55 if dark else 0.75))
+        roles_extra["out_grad2"] = _from_hls(g2h, gl, min(g2s, 0.55 if dark else 0.75))
+        out_backs += [roles_extra["out_grad1"], roles_extra["out_grad2"]]
+
+    out_text = _fit(_from_hls(ah, 0.97 if dark else 0.08, 0.25),
+                    [(b, 8.0) for b in out_backs], dark)
+    out_subtext = _fit(_mix(out_text, out_bubble, 0.38), [(b, 4.6) for b in out_backs], dark)
+    out_cons5 = [(b, 5.0) for b in out_backs]
+    out_accent = _fit(_mix(A[1], out_text, 0.35), out_cons5, dark)
+    out_accent2 = _fit(_mix(A[2], out_text, 0.35), out_cons5, dark)
+    out_link = _fit(_mix(A[3], out_text, 0.30), out_cons5, dark)
+    out_danger = _fit(danger, [(b, 4.5) for b in out_backs], dark)
+    out_success = _fit(success, [(b, 4.5) for b in out_backs], dark)
+
+    roles = {
+        "bg": bg, "bg_hi": bg_hi, "bg_lo": bg_lo, "panel": panel,
+        "action_bar": action_bar, "in_bubble": in_bubble, "out_bubble": out_bubble,
+        "on_accent": on_accent, "text": text, "subtext": subtext, "link": link,
+        "divider": _mix(bg, text, 0.14),
+        "seek_bg": _mix(bg, text, 0.25),
+        "seek_fill": A[0],
+        "reply_line": A[1],
+        "sel": _mix(in_bubble, A[0], 0.28),
+        "danger": danger, "success": success, "warning": warning,
+        "out_text": out_text, "out_subtext": out_subtext,
+        "out_accent": out_accent, "out_accent2": out_accent2, "out_link": out_link,
+        "out_danger": out_danger, "out_success": out_success,
+        "out_seek_bg": _mix(out_bubble, out_text, 0.28),
+        "out_seek_fill": out_accent,
+        "out_panel": _mix(out_bubble, out_text, 0.12),
+        "out_sel": _mix(out_bubble, out_accent, 0.30),
+    }
+    for i, a in enumerate(A):
+        roles["accent" if i == 0 else "accent%d" % (i + 1)] = a
+    roles.update(roles_extra)
+
+    meta = {
+        "is_dark": dark,
+        "colors": len(colors),
+        "accents": ["#" + _to_hex(a) for a in A],
+    }
+    return roles, meta
+
+
+# ======================================================================
+#          КАРТА «КЛЮЧ ТЕМЫ → РОЛЬ» (каждый элемент интерфейса)
+#   формат:  ключ=роль          цвет без прозрачности
+#            ключ=роль@AA       фиксированная прозрачность (hex)
+#            ключ=роль@A        прозрачность, заданная пользователем
+#            ключ=#aarrggbb     готовый цвет
+#   Для chat_out* роли text/subtext/accent/link/... автоматически
+#   заменяются на out_* — они подогнаны под цвет исходящего пузыря.
+# ======================================================================
+
+SPEC = """actionBarActionModeDefault=action_bar@A
+actionBarActionModeDefaultIcon=text
+actionBarActionModeDefaultSelector=accent@44
+actionBarActionModeDefaultTop=bg_lo
+actionBarActionModeReaction=accent
+actionBarActionModeReactionText=text
+actionBarActionModeReactionDot=text
+actionBarBrowser=accent
+actionBarDefault=action_bar@A
+actionBarDefaultArchived=accent2
+actionBarDefaultArchivedIcon=on_accent
+actionBarDefaultArchivedSearch=on_accent
+actionBarDefaultArchivedSelector=on_accent@33
+actionBarDefaultArchivedTitle=on_accent
+actionBarDefaultIcon=text
+actionBarDefaultSearch=accent
+actionBarDefaultSearchArchivedPlaceholder=on_accent@99
+actionBarDefaultSearchPlaceholder=subtext
+actionBarDefaultSelector=accent@44
+actionBarDefaultSubmenuBackground=bg@A
+actionBarDefaultSubmenuItem=text
+actionBarDefaultSubmenuItemIcon=text
+actionBarDefaultSubmenuSeparator=divider
+actionBarDefaultSubtitle=subtext
+actionBarDefaultTitle=text
+actionBarTabActiveText=accent
+actionBarTabLine=accent
+actionBarTabSelector=accent@44
+actionBarTabUnactiveText=subtext
+actionBarWhiteSelector=accent@44
+avatar_actionBarIconBlue=on_accent
+avatar_actionBarSelectorBlue=on_accent@33
+avatar_backgroundActionBarBlue=accent
+avatar_backgroundArchived=accent2
+avatar_backgroundArchivedHidden=accent3
+avatar_backgroundBlue=accent
+avatar_backgroundCyan=accent2
+avatar_backgroundGreen=success
+avatar_backgroundInProfileBlue=accent
+avatar_backgroundOrange=warning
+avatar_backgroundPink=accent3
+avatar_backgroundRed=danger
+avatar_backgroundSaved=accent
+avatar_backgroundViolet=accent4
+avatar_background2Blue=accent
+avatar_background2Cyan=accent2
+avatar_background2Green=success
+avatar_background2Orange=warning
+avatar_background2Pink=accent3
+avatar_background2Red=danger
+avatar_background2Saved=accent
+avatar_background2Violet=accent4
+avatar_nameInMessageBlue=accent
+avatar_nameInMessageCyan=accent2
+avatar_nameInMessageGreen=success
+avatar_nameInMessageOrange=warning
+avatar_nameInMessagePink=accent3
+avatar_nameInMessageRed=danger
+avatar_nameInMessageViolet=accent4
+avatar_subtitleInProfileBlue=on_accent@cc
+avatar_text=on_accent@A
+bot_loadingIcon=text
+calls_callReceivedGreenIcon=success
+calls_callReceivedRedIcon=danger
+changephoneinfo_image2=text
+chats_actionBackground=accent
+chats_actionIcon=on_accent@A
+chats_actionMessage=accent
+chats_actionPressedBackground=accent2
+chats_archiveBackground=accent2
+chats_archiveIcon=on_accent@A
+chats_archivePinBackground=accent
+chats_archivePullDownBackground=accent
+chats_archivePullDownBackgroundActive=accent2
+chats_archiveText=on_accent@A
+chats_attachMessage=accent
+chats_date=subtext
+chats_draft=accent
+chats_mentionIcon=on_accent@A
+chats_menuBackground=bg@A
+chats_menuItemCheck=text
+chats_menuItemIcon=text
+chats_menuItemText=text
+chats_menuName=on_accent
+chats_menuPhone=on_accent@cc
+chats_menuPhoneCats=on_accent@cc
+chats_menuTopBackground=accent
+chats_menuTopBackgroundCats=accent2
+chats_menuTopShadow=#00000000
+chats_menuTopShadowCats=#00000000
+chats_message=text
+chats_messageArchived=subtext
+chats_message_threeLines=text
+chats_muteIcon=subtext
+chats_name=text
+chats_nameArchived=subtext
+chats_nameMessage=accent
+chats_nameMessageArchived=accent2
+chats_nameMessageArchived_threeLines=accent2
+chats_nameMessage_threeLines=accent
+chats_onlineCircle=success
+chats_pinnedIcon=text
+chats_pinnedOverlay=#00000000
+chats_secretIcon=accent
+chats_secretName=accent
+chats_sentCheck=accent
+chats_sentClock=subtext
+chats_sentError=danger
+chats_sentErrorIcon=on_accent@A
+chats_sentReadCheck=accent
+chats_tabUnreadActiveBackground=accent
+chats_tabUnreadUnactiveBackground=accent2
+chats_tabletSelectedOverlay=#00000000
+chats_unreadCounter=accent
+chats_unreadCounterMuted=subtext
+chats_unreadCounterText=on_accent@A
+chats_verifiedBackground=accent
+chats_verifiedCheck=on_accent@A
+chat_addContact=accent
+chat_adminSelectedText=text
+chat_adminText=subtext
+chat_attachActiveTab=accent
+chat_attachAudioBackground=accent
+chat_attachAudioText=on_accent@A
+chat_attachCheckBoxBackground=accent
+chat_attachCheckBoxCheck=on_accent@A
+chat_attachContactBackground=accent2
+chat_attachContactText=on_accent@A
+chat_attachEmptyImage=text
+chat_attachFileBackground=accent3
+chat_attachFileText=on_accent@A
+chat_attachGalleryBackground=accent
+chat_attachGalleryText=on_accent@A
+chat_attachIcon=on_accent@A
+chat_attachLocationBackground=accent2
+chat_attachLocationText=on_accent@A
+chat_attachPermissionImage=text
+chat_attachPermissionMark=text
+chat_attachPermissionText=text
+chat_attachPhotoBackground=#00000000
+chat_attachPollBackground=accent
+chat_attachPollText=on_accent@A
+chat_attachUnactiveTab=subtext
+chat_BlurAlpha=#be000000
+chat_BlurAlphaSlow=#be000000
+chat_botButtonText=accent
+chat_botKeyboardButtonBackground=panel@A
+chat_botKeyboardButtonBackgroundPressed=accent@44
+chat_botKeyboardButtonText=accent
+chat_botSwitchToInlineText=accent
+chat_editMediaButton=accent
+chat_emojiBottomPanelIcon=text
+chat_emojiPanelBackground=bg@A
+chat_emojiPanelBackspace=text
+chat_emojiPanelEmptyText=subtext
+chat_emojiPanelIcon=text
+chat_emojiPanelIconSelected=accent
+chat_emojiPanelNewTrending=accent
+chat_emojiPanelShadowLine=divider
+chat_emojiPanelStickerPackSelector=accent@44
+chat_emojiPanelStickerPackSelectorLine=accent
+chat_emojiPanelStickerSetName=text
+chat_emojiPanelStickerSetNameHighlight=accent
+chat_emojiPanelStickerSetNameIcon=text
+chat_emojiPanelTrendingDescription=subtext
+chat_emojiPanelTrendingTitle=text
+chat_emojiSearchBackground=panel@A
+chat_emojiSearchIcon=text
+chat_fieldOverlayText=accent
+chat_gifSaveHintBackground=accent
+chat_gifSaveHintText=on_accent@A
+chat_goDownButton=panel@A
+chat_goDownButtonCounter=on_accent@A
+chat_goDownButtonCounterBackground=accent
+chat_goDownButtonIcon=text
+chat_inAudioCacheSeekbar=subtext
+chat_inAudioDurationSelectedText=text
+chat_inAudioDurationText=subtext
+chat_inAudioPerfomerSelectedText=text
+chat_inAudioPerfomerText=subtext
+chat_inAudioProgress=accent
+chat_inAudioSeekbar=seek_bg
+chat_inAudioSeekbarFill=seek_fill
+chat_inAudioSeekbarSelected=seek_fill
+chat_inAudioSelectedProgress=accent
+chat_inAudioTitleText=text
+chat_inBubble=in_bubble
+chat_inBubbleSelected=sel
+chat_inBubbleShadow=#00000000
+chat_inContactBackground=accent
+chat_inContactIcon=on_accent
+chat_inContactNameText=text
+chat_inContactPhoneSelectedText=text
+chat_inContactPhoneText=subtext
+chat_inDownCall=danger
+chat_inFileBackground=panel@A
+chat_inFileBackgroundSelected=accent@44
+chat_inFileInfoSelectedText=text
+chat_inFileInfoText=subtext
+chat_inFileNameText=text
+chat_inFileProgress=accent
+chat_inFileProgressSelected=accent
+chat_inForwardedNameText=accent
+chat_inInstant=accent
+chat_inInstantSelected=accent2
+chat_inlineResultIcon=accent
+chat_inLoader=accent
+chat_inLoaderPhoto=text
+chat_inLoaderSelected=accent2
+chat_inLocationBackground=accent
+chat_inLocationIcon=on_accent
+chat_inMediaIcon=on_accent
+chat_inMediaIconSelected=on_accent
+chat_inMenu=text
+chat_inMenuSelected=text
+chat_inPollCorrectAnswer=success
+chat_inPollWrongAnswer=danger
+chat_inPreviewInstantText=text
+chat_inPreviewLine=accent
+chat_inPsaNameText=text
+chat_inReactionButtonBackground=accent
+chat_inReactionButtonText=text
+chat_inReactionButtonTextSelected=text
+chat_inReplyLine=reply_line
+chat_inReplyMediaMessageSelectedText=subtext
+chat_inReplyMediaMessageText=subtext
+chat_inReplyMessageText=subtext
+chat_inReplyNameText=link
+chat_inSentClock=subtext
+chat_inSentClockSelected=subtext
+chat_inSiteNameText=accent
+chat_inTextSelectionHighlight=accent@44
+chat_inTimeSelectedText=subtext
+chat_inTimeText=subtext
+chat_inVenueInfoSelectedText=text
+chat_inVenueInfoText=subtext
+chat_inViaBotNameText=accent
+chat_inViews=subtext
+chat_inViewsSelected=subtext
+chat_inVoiceSeekbar=seek_bg
+chat_inVoiceSeekbarFill=seek_fill
+chat_inVoiceSeekbarSelected=seek_fill
+chat_linkSelectBackground=accent@44
+chat_lockIcon=text
+chat_mediaInfoText=text
+chat_mediaLoaderPhoto=bg@aa
+chat_mediaLoaderPhotoIcon=text
+chat_mediaLoaderPhotoIconSelected=text
+chat_mediaLoaderPhotoSelected=bg@aa
+chat_mediaMenu=text
+chat_mediaProgress=text
+chat_mediaSentCheck=text
+chat_mediaSentClock=text
+chat_mediaTimeBackground=bg@88
+chat_mediaTimeText=text
+chat_mediaViews=text
+chat_messageLinkIn=link
+chat_messageLinkOut=link
+chat_messagePanelBackground=panel@A
+chat_messagePanelCancelInlineBot=text
+chat_messagePanelCursor=accent
+chat_messagePanelHint=subtext
+chat_messagePanelIcons=text
+chat_messagePanelSend=accent
+chat_messagePanelShadow=divider
+chat_messagePanelText=text
+chat_messagePanelVoiceBackground=accent
+chat_messagePanelVoiceDelete=text
+chat_messagePanelVoiceDuration=on_accent@A
+chat_messagePanelVoicePressed=accent2
+chat_messageTextIn=text
+chat_messageTextOut=text
+chat_muteIcon=subtext
+chat_outAdminSelectedText=text
+chat_outAdminText=subtext
+chat_outAudioCacheSeekbar=subtext
+chat_outAudioDurationSelectedText=text
+chat_outAudioDurationText=subtext
+chat_outAudioPerfomerSelectedText=text
+chat_outAudioPerfomerText=subtext
+chat_outAudioProgress=accent
+chat_outAudioSeekbar=seek_bg
+chat_outAudioSeekbarFill=seek_fill
+chat_outAudioSeekbarSelected=seek_fill
+chat_outAudioSelectedProgress=accent
+chat_outAudioTitleText=text
+chat_outBubble=out_bubble
+chat_outBubbleGradientAnimated=accent
+chat_outBubbleGradientSelectedOverlay=accent@44
+chat_outBubbleSelected=sel
+chat_outBubbleShadow=#00000000
+chat_outContactBackground=panel@A
+chat_outContactIcon=text
+chat_outContactNameText=text
+chat_outContactPhoneSelectedText=text
+chat_outContactPhoneText=subtext
+chat_outFileBackground=panel@A
+chat_outFileBackgroundSelected=accent@44
+chat_outFileInfoSelectedText=text
+chat_outFileInfoText=subtext
+chat_outFileNameText=text
+chat_outFileProgress=accent
+chat_outFileProgressSelected=accent2
+chat_outForwardedNameText=text
+chat_outInstant=text
+chat_outInstantSelected=text
+chat_outLinkSelectBackground=accent@44
+chat_outLoader=text
+chat_outLoaderSelected=text
+chat_outLocationIcon=out_bubble
+chat_outMediaIcon=out_bubble
+chat_outMediaIconSelected=out_bubble
+chat_outMenu=text
+chat_outMenuSelected=text
+chat_outPollCorrectAnswer=success
+chat_outPollWrongAnswer=danger
+chat_outPreviewInstantText=text
+chat_outPreviewLine=accent
+chat_outPsaNameText=text
+chat_outReactionButtonBackground=accent@88
+chat_outReactionButtonText=text
+chat_outReactionButtonTextSelected=text
+chat_outReplyLine=reply_line
+chat_outReplyMediaMessageSelectedText=subtext
+chat_outReplyMediaMessageText=subtext
+chat_outReplyMessageText=subtext
+chat_outReplyNameText=text
+chat_outSentCheck=text
+chat_outSentCheckRead=text
+chat_outSentCheckReadSelected=text
+chat_outSentCheckSelected=text
+chat_outSentClock=subtext
+chat_outSentClockSelected=subtext
+chat_outSiteNameText=text
+chat_outTextSelectionCursor=text
+chat_outTextSelectionHighlight=accent@44
+chat_outTimeSelectedText=subtext
+chat_outTimeText=subtext
+chat_outUpCall=success
+chat_outVenueInfoSelectedText=text
+chat_outVenueInfoText=subtext
+chat_outViaBotNameText=text
+chat_outViews=subtext
+chat_outViewsSelected=subtext
+chat_outVoiceSeekbar=seek_bg
+chat_outVoiceSeekbarFill=seek_fill
+chat_outVoiceSeekbarSelected=seek_fill
+chat_previewDurationText=text
+chat_previewGameText=text
+chat_recordedVoiceBackground=accent
+chat_recordedVoiceDarkerBackground=accent2
+chat_recordedVoiceDot=danger
+chat_recordedVoicePlayPause=on_accent@A
+chat_recordedVoiceProgress=on_accent
+chat_recordedVoiceProgressInner=on_accent@A
+chat_recordTime=text
+chat_recordVoiceCancel=text
+chat_replyPanelClose=text
+chat_replyPanelIcons=accent
+chat_replyPanelLine=accent
+chat_replyPanelName=accent
+chat_searchPanelIcons=text
+chat_searchPanelText=text
+chat_secretChatStatusText=text
+chat_secretTimeText=text
+chat_selectedBackground=accent@55
+chat_sentError=danger
+chat_sentErrorIcon=on_accent@A
+chat_serviceBackground=bg@88
+chat_serviceBackgroundSelected=accent@aa
+chat_serviceBackgroundSelector=accent@44
+chat_serviceIcon=text
+chat_serviceLink=accent
+chat_serviceText=text
+chat_status=accent
+chat_stickerNameText=text
+chat_stickerReplyLine=accent
+chat_stickerReplyMessageText=text
+chat_stickerReplyNameText=accent
+chat_stickerViaBotNameText=text
+chat_stickersHintPanel=panel@A
+chat_textSelectBackground=accent@55
+chat_TextSelectionCursor=text
+chat_topPanelBackground=on_accent
+chat_topPanelClose=text
+chat_topPanelLine=accent
+chat_topPanelMessage=text
+chat_topPanelTitle=accent
+chat_unreadMessagesStartArrowIcon=text
+chat_unreadMessagesStartBackground=accent
+chat_unreadMessagesStartText=on_accent@A
+checkbox=accent
+checkboxCheck=on_accent@A
+checkboxDisabled=subtext
+checkboxSquareBackground=accent
+checkboxSquareCheck=on_accent@A
+checkboxSquareDisabled=subtext
+checkboxSquareUnchecked=subtext
+color_blue=accent
+color_green=success
+color_lightblue=accent2
+color_lightgreen=success
+color_orange=warning
+color_purple=accent4
+color_red=danger
+color_yellow=warning
+contacts_inviteBackground=accent
+contacts_inviteText=on_accent@A
+contextProgressInner1=accent
+contextProgressInner2=accent2
+contextProgressInner3=accent3
+contextProgressInner4=accent4
+contextProgressOuter1=accent
+contextProgressOuter2=accent2
+contextProgressOuter3=accent3
+contextProgressOuter4=accent4
+dialogBackground=bg_hi
+dialogBackgroundGray=bg_hi
+dialogButton=accent
+dialogButtonSelector=accent@44
+dialogCardShadow=#00000000
+dialogCameraIcon=on_accent@A
+dialogCheckboxSquareBackground=accent
+dialogCheckboxSquareCheck=on_accent@A
+dialogCheckboxSquareDisabled=subtext
+dialogCheckboxSquareUnchecked=subtext
+dialogEmptyImage=text
+dialogEmptyText=text
+dialogFloatingButton=accent
+dialogFloatingButtonPressed=accent2
+dialogFloatingIcon=on_accent@A
+dialogGiftsBackground=accent
+dialogGiftsTabText=text
+dialogGrayLine=divider
+dialogIcon=text
+dialogInputField=subtext
+dialogInputFieldActivated=accent
+dialogLineProgress=accent
+dialogLineProgressBackground=seek_bg
+dialogLinkSelection=accent@44
+dialogRadioBackground=subtext
+dialogRadioBackgroundChecked=accent
+dialogReactionMentionBackground=accent
+dialogRoundCheckBox=accent
+dialogRoundCheckBoxCheck=on_accent@A
+dialogScrollGlow=bg@A
+dialogSearchBackground=panel@A
+dialogSearchHint=subtext
+dialogSearchIcon=text
+dialogSearchText=text
+dialogShadowLine=divider
+dialogSwipeRemove=danger
+dialogTextBlack=text
+dialogTextBlue=accent
+dialogTextBlue2=accent2
+dialogTextBlue4=accent
+dialogTextGray=subtext
+dialogTextGray2=subtext
+dialogTextGray3=subtext
+dialogTextGray4=subtext
+dialogTextHint=subtext
+dialogTextLink=link
+dialogTopBackground=accent
+dialog_inlineProgress=accent
+dialog_inlineProgressBackground=seek_bg
+dialog_liveLocationProgress=accent
+divider=divider@66
+emptyListPlaceholder=subtext
+fastScrollActive=accent
+fastScrollInactive=subtext
+fastScrollText=on_accent@A
+featuredStickers_addButton=accent
+featuredStickers_addButtonPressed=accent2
+featuredStickers_addedIcon=accent
+featuredStickers_buttonProgress=accent
+featuredStickers_buttonText=on_accent@A
+featuredStickers_removeButtonText=danger
+featuredStickers_unread=accent
+files_folderIcon=on_accent
+files_folderIconBackground=accent
+files_iconText=on_accent
+fill_RedNormal=danger
+fill_RedDark=danger
+gift_ribbon=accent
+gift_ribbon_soldout=accent2
+graySection=subtext
+groupcreate_cursor=accent
+groupcreate_hintText=subtext
+groupcreate_sectionShadow=divider
+groupcreate_sectionText=text
+groupcreate_spanBackground=panel@A
+groupcreate_spanDelete=accent
+groupcreate_spanText=text
+inappPlayerBackground=bg_hi
+inappPlayerClose=text
+inappPlayerPerformer=subtext
+inappPlayerPlayPause=accent
+inappPlayerTitle=text
+iv_ab_progress=accent
+iv_background=#00000000
+iv_backgroundGray=#00000000
+iv_navigationBackground=#00000000
+key_chat_messagePanelVoiceLock=text
+key_chat_messagePanelVoiceLockBackground=accent
+key_chat_messagePanelVoiceLockShadow=#00000000
+key_graySectionText=text
+key_player_progressCachedBackground=subtext
+key_sheet_other=text
+key_sheet_scrollUp=accent
+listSelectorSDK21=accent@22
+location_actionActiveIcon=accent
+location_actionBackground=accent
+location_actionIcon=text
+location_actionPressedBackground=accent2
+location_liveLocationProgress=accent
+location_placeLocationBackground=accent
+location_sendLiveLocationBackground=accent
+location_sendLiveLocationIcon=on_accent@A
+location_sendLiveLocationText=on_accent@A
+location_sendLocationBackground=accent
+location_sendLocationIcon=on_accent@A
+location_sendLocationText=on_accent@A
+login_progressInner=accent
+login_progressOuter=accent2
+passport_authorizeBackground=accent
+passport_authorizeBackgroundSelected=accent2
+passport_authorizeText=on_accent@A
+picker_badge=accent
+picker_badgeText=on_accent@A
+picker_disabledButton=subtext
+picker_enabledButton=accent
+player_actionBarItems=text
+player_actionBarSelector=accent@44
+player_actionBarSubtitle=subtext
+player_actionBarTitle=text
+player_background=bg_hi
+player_button=text
+player_buttonActive=accent
+player_progress=accent
+player_progressBackground=bg@A
+player_time=text
+premiumCoinGradient1=accent
+premiumCoinGradient2=accent2
+premiumGradient0=accent
+premiumGradient1=accent2
+premiumGradient2=accent3
+premiumGradient3=accent4
+premiumGradient4=accent5
+premiumGradientBackground1=accent
+premiumGradientBackground2=accent2
+premiumGradientBackground3=accent3
+premiumGradientBackground4=accent4
+premiumGradientBackgroundOverlay=accent
+premiumGradientBottomSheet1=accent
+premiumGradientBottomSheet2=accent2
+premiumGradientBottomSheet3=accent3
+premiumStarGradient1=accent
+premiumStarGradient2=accent2
+premiumStartSmallStarsColor=accent
+premiumStartSmallStarsColor2=accent2
+profile_actionBackground=accent
+profile_actionIcon=on_accent@A
+profile_actionPressedBackground=accent2
+profile_creatorIcon=accent
+profile_status=on_accent@cc
+profile_tabSelectedLine=accent
+profile_tabSelectedText=accent
+profile_tabSelector=accent@44
+profile_tabText=subtext
+profile_title=on_accent
+profile_verifiedBackground=accent
+profile_verifiedCheck=on_accent@A
+progressCircle=accent
+radioBackground=subtext
+radioBackgroundChecked=accent
+reactionStarSelector=accent
+returnToCallBackground=accent
+returnToCallMutedBackground=accent2
+returnToCallText=on_accent@A
+sessions_devicesImage=text
+sharedMedia_linkPlaceholder=panel@A
+sharedMedia_linkPlaceholderText=text
+sharedMedia_photoPlaceholder=panel@A
+sharedMedia_startStopLoadIcon=accent
+statisticChartActiveLine=accent
+statisticChartActivePickerChart=accent
+statisticChartLineEmpty=subtext
+statisticChartLine_blue=accent
+statisticChartLine_cyan=accent2
+statisticChartLine_golden=warning
+statisticChartLine_green=success
+statisticChartLine_indigo=accent4
+statisticChartLine_lightblue=accent5
+statisticChartLine_lightgreen=accent7
+statisticChartLine_orange=warning
+statisticChartLine_purple=accent6
+statisticChartLine_red=danger
+statisticChartRipple=accent
+statisticChartSignature=accent
+statisticChartSignatureAlpha=accent
+stickers_menu=text
+stickers_menuSelector=text@33
+stories_circle_closeFriends1=success
+stories_circle_closeFriends2=accent5
+stories_circle_dialog1=accent
+stories_circle_dialog2=accent2
+stories_circle1=accent
+stories_circle2=accent2
+switch2Track=seek_bg
+switch2TrackChecked=accent
+switchTrack=seek_bg
+switchTrackBlue=seek_bg
+switchTrackBlueChecked=accent
+switchTrackBlueSelector=accent@44
+switchTrackBlueSelectorChecked=accent@44
+switchTrackBlueThumb=text
+switchTrackBlueThumbChecked=on_accent
+switchTrackChecked=accent
+table_background=panel
+table_border=divider
+text_RedBold=danger
+text_RedRegular=danger
+topics_unreadCounter=accent
+topics_unreadCounterMuted=subtext
+undo_background=bg_hi@ee
+undo_cancelColor=text
+undo_infoColor=text
+voipgroup_actionBar=bg_lo
+voipgroup_actionBarItems=text
+voipgroup_actionBarItemsSelector=accent@44
+voipgroup_actionBarUnscrolled=bg_lo
+voipgroup_checkMenu=accent
+voipgroup_connectingProgress=accent
+voipgroup_dialogBackground=bg
+voipgroup_disabledButton=bg_hi
+voipgroup_disabledButtonActive=bg_hi
+voipgroup_disabledButtonActiveScrolled=bg_hi
+voipgroup_inviteMembersBackground=accent
+voipgroup_lastSeenText=text
+voipgroup_lastSeenTextUnscrolled=text
+voipgroup_leaveButton=danger
+voipgroup_leaveButtonScrolled=danger
+voipgroup_leaveCallMenu=danger
+voipgroup_listeningText=text
+voipgroup_listSelector=accent@44
+voipgroup_listViewBackground=bg
+voipgroup_listViewBackgroundUnscrolled=bg
+voipgroup_muteButton=accent
+voipgroup_muteButton2=accent2
+voipgroup_muteButton3=accent3
+voipgroup_mutedByAdminGradient=accent
+voipgroup_mutedByAdminGradient2=accent2
+voipgroup_mutedByAdminGradient3=accent3
+voipgroup_mutedByAdminIcon=text
+voipgroup_mutedByAdminMuteButton=accent
+voipgroup_mutedByAdminMuteButtonDisabled=accent
+voipgroup_mutedIcon=text
+voipgroup_mutedIconUnscrolled=text
+voipgroup_nameText=text
+voipgroup_overlayAlertGradientMuted=accent
+voipgroup_overlayAlertGradientMuted2=accent2
+voipgroup_overlayAlertGradientUnmuted=accent
+voipgroup_overlayAlertGradientUnmuted2=accent2
+voipgroup_overlayAlertMutedByAdmin=accent
+voipgroup_overlayAlertMutedByAdmin2=accent2
+voipgroup_overlayBlue1=accent
+voipgroup_overlayBlue2=accent2
+voipgroup_overlayGreen1=success
+voipgroup_overlayGreen2=accent5
+voipgroup_rtmpButton=accent
+voipgroup_scrollUp=accent
+voipgroup_searchBackground=panel
+voipgroup_searchPlaceholder=subtext
+voipgroup_searchText=text
+voipgroup_soundButton=accent
+voipgroup_soundButton2=accent2
+voipgroup_soundButtonActive=accent
+voipgroup_soundButtonActive2=accent2
+voipgroup_soundButtonActive2Scrolled=accent2
+voipgroup_soundButtonActiveScrolled=accent
+voipgroup_speakingText=text
+voipgroup_topPanelBlue1=accent
+voipgroup_topPanelBlue2=accent2
+voipgroup_topPanelGray=bg_hi
+voipgroup_topPanelGreen1=success
+voipgroup_topPanelGreen2=accent
+voipgroup_unmuteButton=accent
+voipgroup_unmuteButton2=accent2
+voipgroup_windowBackgroundWhiteInputField=accent
+voipgroup_windowBackgroundWhiteInputFieldActivated=accent
+windowBackgroundChecked=accent
+windowBackgroundCheckText=on_accent@A
+windowBackgroundGray=bg_lo@A
+windowBackgroundGrayShadow=#00000000
+windowBackgroundUnchecked=text
+windowBackgroundWhite=bg@A
+windowBackgroundWhiteBlackText=text
+windowBackgroundWhiteBlueButton=accent
+windowBackgroundWhiteBlueHeader=accent
+windowBackgroundWhiteBlueIcon=accent
+windowBackgroundWhiteBlueText=accent
+windowBackgroundWhiteBlueText2=accent2
+windowBackgroundWhiteBlueText3=accent
+windowBackgroundWhiteBlueText4=accent
+windowBackgroundWhiteBlueText5=accent
+windowBackgroundWhiteBlueText6=accent
+windowBackgroundWhiteBlueText7=accent
+windowBackgroundWhiteGrayIcon=subtext
+windowBackgroundWhiteGrayText=subtext
+windowBackgroundWhiteGrayText2=subtext
+windowBackgroundWhiteGrayText3=subtext
+windowBackgroundWhiteGrayText4=subtext
+windowBackgroundWhiteGrayText5=subtext
+windowBackgroundWhiteGrayText6=subtext
+windowBackgroundWhiteGrayText7=subtext
+windowBackgroundWhiteGrayText8=subtext
+windowBackgroundWhiteGreenText=success
+windowBackgroundWhiteGreenText2=success
+windowBackgroundWhiteHintText=subtext
+windowBackgroundWhiteInputField=subtext
+windowBackgroundWhiteInputFieldActivated=accent
+windowBackgroundWhiteLinkSelection=accent@44
+windowBackgroundWhiteLinkText=link
+windowBackgroundWhiteValueText=accent
+chat_wallpaper=#00000000
+chat_wallpaper_gradient_to=#00000000
+key_chat_wallpaper_gradient_to2=#00000000
+key_chat_wallpaper_gradient_to3=#00000000
+dialogTextRed=danger
+dialogTextRed2=danger
+dialogTextBlue3=accent
+dialogInputFieldText=text
+dialogBadgeBackground=accent
+dialogBadgeText=on_accent@A
+windowBackgroundWhiteRadius=bg@A
+windowBackgroundWhiteRedText=danger
+windowBackgroundWhiteRedText2=danger
+windowBackgroundWhiteRedText3=danger
+windowBackgroundWhiteRedText4=danger
+windowBackgroundWhiteRedText5=danger
+windowBackgroundWhiteRedText6=danger
+windowBackgroundWhiteGrayLine=divider
+windowBackgroundGrayLine=divider
+profile_adminIcon=accent
+switchThumb=text
+switchThumbChecked=on_accent
+chat_inReplyBackground=text@28
+chat_outReplyBackground=text@28
+chat_replyPanelMessage=text
+chat_attachAudioIcon=on_accent
+chat_attachContactIcon=on_accent
+chat_attachFileIcon=on_accent
+chat_attachGalleryIcon=on_accent
+chat_attachLocationIcon=on_accent
+chat_attachPollIcon=on_accent
+chat_attachMediaBanBackground=bg_hi
+chat_attachMediaBanText=text
+chat_emojiPanelBadgeBackground=accent
+chat_emojiPanelBadgeText=on_accent
+chat_outLocationBackground=accent"""
+
+_OUT_MAP = {
+    "text": "out_text", "subtext": "out_subtext",
+    "accent": "out_accent", "accent2": "out_accent2", "accent3": "out_accent2",
+    "link": "out_link", "seek_bg": "out_seek_bg", "seek_fill": "out_seek_fill",
+    "panel": "out_panel", "sel": "out_sel", "reply_line": "out_accent2",
+    "danger": "out_danger", "success": "out_success",
+}
+
+
+def _is_out_key(key):
+    return key.startswith("chat_out") or key in ("chat_messageTextOut", "chat_messageLinkOut")
+
+
+def _render_theme(roles, alpha_hex, grad=False):
+    out = []
+    for raw in SPEC.splitlines():
+        raw = raw.strip()
+        if not raw or "=" not in raw:
+            continue
+        key, val = raw.split("=", 1)
+        if val.startswith("#"):
+            out.append(raw)
+            continue
+        role, _, al = val.partition("@")
+        if _is_out_key(key):
+            role = _OUT_MAP.get(role, role)
+        col = roles.get(role)
+        if col is None:
+            logger.warning("TgTheme: unknown role %s for %s", role, key)
+            col = roles["accent"]
+        a = alpha_hex if al == "A" else (al or "ff")
+        out.append("%s=#%s%s" % (key, a, _to_hex(col)))
+
+    if grad:
+        for k, r in (("chat_outBubbleGradient1", "out_grad1"),
+                     ("chat_outBubbleGradient2", "out_grad2"),
+                     ("chat_outBubbleGradient3", "out_bubble")):
+            out.append("%s=#ff%s" % (k, _to_hex(roles[r])))
+    return "\n".join(out) + "\n", len(out)
+
+
+# ======================================================================
+#                                МОДУЛЬ
+# ======================================================================
 
 @loader.tds
 class tgtheme(loader.Module):
-    """Module that creates an android-theme from a photo with smart per-element color calculation"""
+    """Module that creates an android-theme from a photo: every photo color is used, every element is colored"""
 
     strings = {
         "name": "TgTheme",
         "no_photo": "<b>Reply to a photo</b>",
-        "processing": "<b>🎨 Creating smart theme...</b>",
-        "done": "<b>✨ Theme ready!</b>\n<b>🎭 Type:</b> {}\n<b>🔹 Transparency:</b> {}%\n<b>💬 Text:</b> {}\n<b>🎨 Colors:</b> {} extracted",
+        "processing": "<b>🎨 Building the theme...</b>",
+        "done": (
+            "<b>✨ Theme ready!</b>\n"
+            "<b>🎭 Type:</b> {}\n"
+            "<b>🔹 Transparency:</b> {}%\n"
+            "<b>🎨 Photo colors found:</b> {}\n"
+            "<b>🖌 Accents:</b> {}\n"
+            "<b>🧩 Elements colored:</b> {}"
+        ),
+        "dark": "🌙 Dark",
+        "light": "☀️ Light",
         "error": "<b>❌ Error:</b> {}",
     }
 
     strings_ru = {
-        "_cls_doc": "Модуль который создаёт тг-тему по фото с умным подбором цвета для каждой детали",
+        "_cls_doc": "Модуль, который создаёт тг-тему по фото: используются все цвета фото, раскрашен каждый элемент",
         "no_photo": "<b>Ответьте на фото</b>",
-        "processing": "<b>🎨 Создаю умную тему...</b>",
-        "done": "<b>✨ Тема готова!</b>\n<b>🎭 Тип:</b> {}\n<b>🔹 Прозрачность:</b> {}%\n<b>💬 Текст:</b> {}\n<b>🎨 Цветов:</b> {} извлечено",
+        "processing": "<b>🎨 Собираю тему...</b>",
+        "done": (
+            "<b>✨ Тема готова!</b>\n"
+            "<b>🎭 Тип:</b> {}\n"
+            "<b>🔹 Прозрачность:</b> {}%\n"
+            "<b>🎨 Цветов найдено в фото:</b> {}\n"
+            "<b>🖌 Акценты:</b> {}\n"
+            "<b>🧩 Элементов раскрашено:</b> {}"
+        ),
+        "dark": "🌙 Тёмная",
+        "light": "☀️ Светлая",
         "error": "<b>❌ Ошибка:</b> {}",
     }
-
-    # ==================== УМНАЯ ЦВЕТОВАЯ БИБЛИОТЕКА ====================
-
-    def _rgb(self, h):
-        """HEX → (r, g, b)"""
-        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-    def _hex(self, r, g, b):
-        """(r, g, b) → HEX"""
-        return f"{max(0, min(255, int(r))):02x}{max(0, min(255, int(g))):02x}{max(0, min(255, int(b))):02x}"
-
-    def _brightness(self, h):
-        """Яркость цвета (0-255)"""
-        r, g, b = self._rgb(h)
-        return r * 0.299 + g * 0.587 + b * 0.114
-
-    def _saturation(self, h):
-        """Насыщенность (0-1)"""
-        r, g, b = [x / 255 for x in self._rgb(h)]
-        mx, mn = max(r, g, b), min(r, g, b)
-        if mx == 0:
-            return 0
-        return (mx - mn) / mx
-
-    def _darken(self, h, factor=0.7):
-        """Затемняет цвет"""
-        r, g, b = self._rgb(h)
-        return self._hex(r * factor, g * factor, b * factor)
-
-    def _lighten(self, h, factor=0.3):
-        """Осветляет цвет (смешивает с белым)"""
-        r, g, b = self._rgb(h)
-        return self._hex(r + (255 - r) * factor, g + (255 - g) * factor, b + (255 - b) * factor)
-
-    def _blend(self, h1, h2, ratio=0.5):
-        """Смешивает два цвета"""
-        r1, g1, b1 = self._rgb(h1)
-        r2, g2, b2 = self._rgb(h2)
-        return self._hex(
-            r1 * (1 - ratio) + r2 * ratio,
-            g1 * (1 - ratio) + g2 * ratio,
-            b1 * (1 - ratio) + b2 * ratio
-        )
-
-    def _contrast(self, h, dark="1a1a1a", light="f5f5f5"):
-        """Возвращает контрастный цвет (тёмный или светлый)"""
-        return light if self._brightness(h) < 140 else dark
-
-    def _adjust_for_bg(self, color, bg, min_diff=45):
-        """Если цвет слишком похож на фон — корректирует его"""
-        if abs(self._brightness(color) - self._brightness(bg)) < min_diff:
-            if self._brightness(bg) > 140:
-                return self._darken(color, 0.55)
-            else:
-                return self._lighten(color, 0.45)
-        return color
-
-    def _extract_palette(self, img, count=12):
-        """Извлекает богатую палитру + сортирует по яркости и насыщенности"""
-        small = img.copy().convert("RGB")
-        if max(small.size) > 220:
-            scale = 220 / max(small.size)
-            small = small.resize(
-                (int(small.size[0] * scale), int(small.size[1] * scale)),
-                Image.LANCZOS,
-            )
-
-        buckets = {}
-        for r, g, b in small.getdata():
-            # Более точная квантизация
-            key = (r >> 3, g >> 3, b >> 3)
-            if key not in buckets:
-                buckets[key] = [r, g, b, 1]
-            else:
-                buckets[key][0] += r
-                buckets[key][1] += g
-                buckets[key][2] += b
-                buckets[key][3] += 1
-
-        top = sorted(buckets.values(), key=lambda x: x[3], reverse=True)
-        colors = []
-        for sr, sg, sb, c in top[:count * 2]:  # берём с запасом
-            hex_c = self._hex(sr // c, sg // c, sb // c)
-            # Фильтруем слишком похожие цвета
-            if all(abs(self._brightness(hex_c) - self._brightness(ex)) > 18 or
-                   abs(self._saturation(hex_c) - self._saturation(ex)) > 0.12
-                   for ex in colors):
-                colors.append(hex_c)
-            if len(colors) >= count:
-                break
-
-        # Сортируем: сначала по яркости, потом по насыщенности
-        colors = sorted(colors, key=lambda h: (self._brightness(h), self._saturation(h)))
-        return colors
-
-    def _build_smart_palette(self, colors):
-        """Строит умную палитру для всех элементов темы"""
-        if not colors:
-            colors = ["1a1a1a", "888888", "ffffff"]
-
-        # Основной фон (самый частотный / средний по яркости)
-        mid = len(colors) // 2
-        bg = colors[mid] if colors else "1e1e1e"
-
-        # Определяем тёмная/светлая тема
-        is_dark = self._brightness(bg) < 145
-
-        # Текст основной
-        text = "f0f0f0" if is_dark else "1a1a1a"
-        subtext = "b0b0b0" if is_dark else "555555"
-
-        # Акценты — самые насыщенные цвета
-        saturated = sorted(colors, key=self._saturation, reverse=True)
-        accent = saturated[0] if saturated else ("6ba3ff" if is_dark else "2b6cb0")
-        accent = self._adjust_for_bg(accent, bg)
-
-        # Второй акцент (чуть другой оттенок)
-        accent2 = saturated[1] if len(saturated) > 1 else self._blend(accent, "ffffff" if is_dark else "000000", 0.25)
-        accent2 = self._adjust_for_bg(accent2, bg)
-
-        # Третий акцент
-        accent3 = saturated[2] if len(saturated) > 2 else self._blend(accent, accent2, 0.5)
-
-        # Бабблы
-        if is_dark:
-            in_bubble = self._lighten(bg, 0.08)          # входящие чуть светлее фона
-            out_bubble = self._blend(accent, bg, 0.35)   # исходящие с акцентом
-        else:
-            in_bubble = self._darken(bg, 0.92)
-            out_bubble = self._blend(accent, "ffffff", 0.25)
-
-        in_bubble = self._adjust_for_bg(in_bubble, bg, 25)
-        out_bubble = self._adjust_for_bg(out_bubble, bg, 30)
-
-        # Панели и action bar
-        action_bar = self._darken(bg, 0.85) if is_dark else self._lighten(bg, 0.12)
-        panel = self._blend(bg, accent, 0.08)
-
-        # Ссылки
-        link = self._lighten(accent, 0.25) if is_dark else self._darken(accent, 0.75)
-        link = self._adjust_for_bg(link, bg, 50)
-
-        # Разделители / тени
-        divider = self._blend(bg, text, 0.18)
-        shadow = "000000" if is_dark else "ffffff"
-
-        # Плеер / диалоги (плотный фон)
-        solid = bg
-
-        # Цвета для голосовых, прогресса и т.д.
-        seek_fill = accent if is_dark else self._darken(accent, 0.8)
-        seek_bg = self._blend(bg, text, 0.25)
-
-        # Реплаи / цитаты
-        reply_line = accent2
-        reply_bg = f"28{text}" if is_dark else f"18{text}"  # полупрозрачный
-
-        # Иконки
-        icon = text
-        icon_active = accent
-
-        return {
-            "bg": bg,
-            "text": text,
-            "subtext": subtext,
-            "accent": accent,
-            "accent2": accent2,
-            "accent3": accent3,
-            "in_bubble": in_bubble,
-            "out_bubble": out_bubble,
-            "action_bar": action_bar,
-            "panel": panel,
-            "link": link,
-            "divider": divider,
-            "shadow": shadow,
-            "solid": solid,
-            "seek_fill": seek_fill,
-            "seek_bg": seek_bg,
-            "reply_line": reply_line,
-            "reply_bg": reply_bg,
-            "icon": icon,
-            "icon_active": icon_active,
-            "is_dark": is_dark,
-            "palette_size": len(colors),
-        }
 
     def _theme_wallpaper(self, img, max_size=1920):
         """Создаёт обои из изображения"""
         output = io.BytesIO()
         img_copy = img.copy()
-        if img_copy.mode != 'RGB':
-            img_copy = img_copy.convert('RGB')
+        if img_copy.mode != "RGB":
+            img_copy = img_copy.convert("RGB")
         if max(img_copy.size) > max_size:
             scale = max_size / max(img_copy.size)
             img_copy = img_copy.resize(
                 (int(img_copy.size[0] * scale), int(img_copy.size[1] * scale)),
-                Image.LANCZOS
+                Image.LANCZOS,
             )
-        img_copy.save(output, format='JPEG', quality=88, optimize=True)
+        img_copy.save(output, format="JPEG", quality=88, optimize=True)
         return output.getvalue()
 
-    def _build_theme(self, p, alpha="e6"):
-        """Строит тему, используя умную палитру для каждой детали"""
-        a = alpha  # прозрачность для фонов
+    @staticmethod
+    def _open_image(photo_bytes):
+        img = Image.open(io.BytesIO(photo_bytes))
+        if ImageOps is not None:
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+        if img.mode in ("RGBA", "LA", "P"):
+            rgba = img.convert("RGBA")
+            base = Image.new("RGBA", rgba.size, (128, 128, 128, 255))
+            base.alpha_composite(rgba)
+            return base.convert("RGB")
+        return img.convert("RGB")
 
-        def c(key, force_alpha=None):
-            """Быстрый хелпер: цвет из палитры + альфа"""
-            col = p[key]
-            al = force_alpha if force_alpha is not None else a
-            return f"#{al}{col}"
-
-        def solid(key):
-            return f"#ff{p[key]}"
-
-        def plain(key):
-            return f"#{p[key]}"
-
-        # Выбранный цвет для selection
-        dsel = f"#ff{self._blend(p['bg'], p['accent'], 0.28)}"
-
-        theme = f"""actionBarActionModeDefault={c('action_bar')}
-actionBarActionModeDefaultIcon={plain('text')}
-actionBarActionModeDefaultSelector={plain('accent')}
-actionBarActionModeDefaultTop={plain('accent')}
-actionBarActionModeReaction={plain('accent')}
-actionBarActionModeReactionText={plain('text')}
-actionBarActionModeReactionDot={plain('text')}
-actionBarBrowser={plain('accent')}
-actionBarDefault={c('action_bar')}
-actionBarDefaultArchived={plain('accent2')}
-actionBarDefaultArchivedIcon={plain('text')}
-actionBarDefaultArchivedSearch={plain('accent')}
-actionBarDefaultArchivedSelector={plain('accent')}
-actionBarDefaultArchivedTitle={plain('text')}
-actionBarDefaultIcon={plain('text')}
-actionBarDefaultSearch={plain('accent')}
-actionBarDefaultSearchArchivedPlaceholder={plain('subtext')}
-actionBarDefaultSearchPlaceholder={plain('subtext')}
-actionBarDefaultSelector={plain('accent')}
-actionBarDefaultSubmenuBackground={c('bg')}
-actionBarDefaultSubmenuItem={plain('text')}
-actionBarDefaultSubmenuItemIcon={plain('text')}
-actionBarDefaultSubmenuSeparator={plain('divider')}
-actionBarDefaultSubtitle={plain('subtext')}
-actionBarDefaultTitle={plain('text')}
-actionBarTabActiveText={plain('accent')}
-actionBarTabLine={plain('accent')}
-actionBarTabSelector={plain('accent')}
-actionBarTabUnactiveText={plain('subtext')}
-actionBarWhiteSelector={plain('accent')}
-avatar_actionBarIconBlue={plain('text')}
-avatar_actionBarSelectorBlue={plain('accent')}
-avatar_backgroundActionBarBlue={plain('accent')}
-avatar_backgroundArchived={plain('accent2')}
-avatar_backgroundArchivedHidden={plain('accent3')}
-avatar_backgroundBlue={plain('accent')}
-avatar_backgroundCyan={plain('accent2')}
-avatar_backgroundGreen={plain('accent3')}
-avatar_backgroundInProfileBlue={plain('text')}
-avatar_backgroundOrange={plain('accent')}
-avatar_backgroundPink={plain('accent2')}
-avatar_backgroundRed={plain('accent3')}
-avatar_backgroundSaved={plain('accent')}
-avatar_backgroundViolet={plain('accent2')}
-avatar_background2Blue={plain('accent')}
-avatar_background2Cyan={plain('accent2')}
-avatar_background2Green={plain('accent3')}
-avatar_background2Orange={plain('accent')}
-avatar_background2Pink={plain('accent2')}
-avatar_background2Red={plain('accent3')}
-avatar_background2Saved={plain('accent')}
-avatar_background2Violet={plain('accent2')}
-avatar_nameInMessageBlue={plain('accent')}
-avatar_nameInMessageCyan={plain('accent2')}
-avatar_nameInMessageGreen={plain('accent3')}
-avatar_nameInMessageOrange={plain('accent')}
-avatar_nameInMessagePink={plain('accent2')}
-avatar_nameInMessageRed={plain('accent3')}
-avatar_nameInMessageViolet={plain('accent2')}
-avatar_subtitleInProfileBlue={plain('subtext')}
-avatar_text={c('bg')}
-bot_loadingIcon={plain('text')}
-calls_callReceivedGreenIcon={plain('accent')}
-calls_callReceivedRedIcon={plain('text')}
-changephoneinfo_image2={plain('text')}
-chats_actionBackground={plain('accent')}
-chats_actionIcon={c('bg')}
-chats_actionMessage={plain('accent')}
-chats_actionPressedBackground={plain('accent2')}
-chats_archiveBackground={plain('accent2')}
-chats_archiveIcon={c('bg')}
-chats_archivePinBackground={plain('accent')}
-chats_archivePullDownBackground={plain('accent')}
-chats_archivePullDownBackgroundActive={plain('accent2')}
-chats_archiveText={c('bg')}
-chats_attachMessage={plain('accent')}
-chats_date={plain('subtext')}
-chats_draft={plain('accent')}
-chats_mentionIcon={c('bg')}
-chats_menuBackground={c('bg')}
-chats_menuItemCheck={plain('text')}
-chats_menuItemIcon={plain('text')}
-chats_menuItemText={plain('text')}
-chats_menuName={plain('accent')}
-chats_menuPhone={plain('subtext')}
-chats_menuPhoneCats={plain('subtext')}
-chats_menuTopBackground={plain('accent')}
-chats_menuTopBackgroundCats={plain('accent2')}
-chats_menuTopShadow=#00000000
-chats_menuTopShadowCats=#00000000
-chats_message={plain('text')}
-chats_messageArchived={plain('subtext')}
-chats_message_threeLines={plain('text')}
-chats_muteIcon={plain('subtext')}
-chats_name={plain('text')}
-chats_nameArchived={plain('subtext')}
-chats_nameMessage={plain('accent')}
-chats_nameMessageArchived={plain('accent2')}
-chats_nameMessageArchived_threeLines={plain('accent2')}
-chats_nameMessage_threeLines={plain('accent')}
-chats_onlineCircle={plain('accent')}
-chats_pinnedIcon={plain('text')}
-chats_pinnedOverlay=#00000000
-chats_secretIcon={plain('accent')}
-chats_secretName={plain('accent')}
-chats_sentCheck={plain('accent')}
-chats_sentClock={plain('subtext')}
-chats_sentError={plain('text')}
-chats_sentErrorIcon={c('bg')}
-chats_sentReadCheck={plain('accent')}
-chats_tabUnreadActiveBackground={plain('accent')}
-chats_tabUnreadUnactiveBackground={plain('accent2')}
-chats_tabletSelectedOverlay=#00000000
-chats_unreadCounter={plain('accent')}
-chats_unreadCounterMuted={plain('subtext')}
-chats_unreadCounterText={c('bg')}
-chats_verifiedBackground={plain('accent')}
-chats_verifiedCheck={c('bg')}
-chat_addContact={plain('accent')}
-chat_adminSelectedText={plain('text')}
-chat_adminText={plain('subtext')}
-chat_attachActiveTab={plain('accent')}
-chat_attachAudioBackground={plain('accent')}
-chat_attachAudioText={c('bg')}
-chat_attachCheckBoxBackground={plain('accent')}
-chat_attachCheckBoxCheck={c('bg')}
-chat_attachContactBackground={plain('accent2')}
-chat_attachContactText={c('bg')}
-chat_attachEmptyImage={plain('text')}
-chat_attachFileBackground={plain('accent3')}
-chat_attachFileText={c('bg')}
-chat_attachGalleryBackground={plain('accent')}
-chat_attachGalleryText={c('bg')}
-chat_attachIcon={c('bg')}
-chat_attachLocationBackground={plain('accent2')}
-chat_attachLocationText={c('bg')}
-chat_attachPermissionImage={plain('text')}
-chat_attachPermissionMark={plain('text')}
-chat_attachPermissionText={plain('text')}
-chat_attachPhotoBackground=#00000000
-chat_attachPollBackground={plain('accent')}
-chat_attachPollText={c('bg')}
-chat_attachUnactiveTab={plain('subtext')}
-chat_BlurAlpha=#be000000
-chat_BlurAlphaSlow=#be000000
-chat_botButtonText={plain('accent')}
-chat_botKeyboardButtonBackground={c('panel')}
-chat_botKeyboardButtonBackgroundPressed={plain('accent')}
-chat_botKeyboardButtonText={plain('accent')}
-chat_botSwitchToInlineText={plain('accent')}
-chat_editMediaButton={plain('accent')}
-chat_emojiBottomPanelIcon={plain('text')}
-chat_emojiPanelBackground={c('bg')}
-chat_emojiPanelBackspace={plain('text')}
-chat_emojiPanelEmptyText={plain('subtext')}
-chat_emojiPanelIcon={plain('text')}
-chat_emojiPanelIconSelected={plain('accent')}
-chat_emojiPanelNewTrending={plain('accent')}
-chat_emojiPanelShadowLine={plain('accent')}
-chat_emojiPanelStickerPackSelector={plain('accent')}
-chat_emojiPanelStickerPackSelectorLine={plain('accent')}
-chat_emojiPanelStickerSetName={plain('text')}
-chat_emojiPanelStickerSetNameHighlight={plain('accent')}
-chat_emojiPanelStickerSetNameIcon={plain('text')}
-chat_emojiPanelTrendingDescription={plain('subtext')}
-chat_emojiPanelTrendingTitle={plain('text')}
-chat_emojiSearchBackground={c('panel')}
-chat_emojiSearchIcon={plain('text')}
-chat_fieldOverlayText={plain('accent')}
-chat_gifSaveHintBackground={plain('accent')}
-chat_gifSaveHintText={c('bg')}
-chat_goDownButton={c('panel')}
-chat_goDownButtonCounter={c('bg')}
-chat_goDownButtonCounterBackground={plain('accent')}
-chat_goDownButtonIcon={plain('text')}
-chat_inAudioCacheSeekbar={plain('subtext')}
-chat_inAudioDurationSelectedText={plain('text')}
-chat_inAudioDurationText={plain('subtext')}
-chat_inAudioPerfomerSelectedText={plain('text')}
-chat_inAudioPerfomerText={plain('subtext')}
-chat_inAudioProgress={plain('accent')}
-chat_inAudioSeekbar={plain('seek_bg')}
-chat_inAudioSeekbarFill={plain('seek_fill')}
-chat_inAudioSeekbarSelected={plain('seek_fill')}
-chat_inAudioSelectedProgress={plain('accent')}
-chat_inAudioTitleText={plain('text')}
-chat_inBubble={solid('in_bubble')}
-chat_inBubbleSelected={dsel}
-chat_inBubbleShadow=#00000000
-chat_inContactBackground={plain('accent')}
-chat_inContactIcon={c('bg')}
-chat_inContactNameText={plain('text')}
-chat_inContactPhoneSelectedText={plain('text')}
-chat_inContactPhoneText={plain('subtext')}
-chat_inDownCall={plain('text')}
-chat_inFileBackground={c('panel')}
-chat_inFileBackgroundSelected={plain('accent')}
-chat_inFileInfoSelectedText={plain('text')}
-chat_inFileInfoText={plain('subtext')}
-chat_inFileNameText={plain('text')}
-chat_inFileProgress={c('bg')}
-chat_inFileProgressSelected={plain('accent')}
-chat_inForwardedNameText={plain('accent')}
-chat_inInstant={plain('accent')}
-chat_inInstantSelected={plain('accent2')}
-chat_inlineResultIcon={plain('accent')}
-chat_inLoader={plain('accent')}
-chat_inLoaderPhoto={plain('text')}
-chat_inLoaderSelected={plain('accent2')}
-chat_inLocationBackground={plain('accent')}
-chat_inLocationIcon={plain('text')}
-chat_inMediaIcon={plain('text')}
-chat_inMediaIconSelected={plain('text')}
-chat_inMenu={plain('text')}
-chat_inMenuSelected={plain('text')}
-chat_inPollCorrectAnswer={plain('accent')}
-chat_inPollWrongAnswer={plain('text')}
-chat_inPreviewInstantText={plain('text')}
-chat_inPreviewLine={plain('accent')}
-chat_inPsaNameText={plain('text')}
-chat_inReactionButtonBackground={plain('accent')}
-chat_inReactionButtonText={plain('text')}
-chat_inReactionButtonTextSelected={plain('text')}
-chat_inReplyLine={plain('reply_line')}
-chat_inReplyMediaMessageSelectedText={plain('subtext')}
-chat_inReplyMediaMessageText={plain('subtext')}
-chat_inReplyMessageText={plain('subtext')}
-chat_inReplyNameText={plain('link')}
-chat_inSentClock={plain('subtext')}
-chat_inSentClockSelected={plain('subtext')}
-chat_inSiteNameText={plain('accent')}
-chat_inTextSelectionHighlight={c('accent', '44')}
-chat_inTimeSelectedText={plain('subtext')}
-chat_inTimeText={plain('subtext')}
-chat_inVenueInfoSelectedText={plain('text')}
-chat_inVenueInfoText={plain('subtext')}
-chat_inViaBotNameText={plain('accent')}
-chat_inViews={plain('subtext')}
-chat_inViewsSelected={plain('subtext')}
-chat_inVoiceSeekbar={plain('seek_bg')}
-chat_inVoiceSeekbarFill={plain('seek_fill')}
-chat_inVoiceSeekbarSelected={plain('seek_fill')}
-chat_linkSelectBackground={c('accent', '44')}
-chat_lockIcon={plain('text')}
-chat_mediaInfoText={plain('text')}
-chat_mediaLoaderPhoto=#00000000
-chat_mediaLoaderPhotoIcon={plain('text')}
-chat_mediaLoaderPhotoIconSelected={plain('text')}
-chat_mediaLoaderPhotoSelected=#00000000
-chat_mediaMenu={plain('text')}
-chat_mediaProgress={c('bg')}
-chat_mediaSentCheck={plain('text')}
-chat_mediaSentClock={plain('text')}
-chat_mediaTimeBackground={c('bg', '88')}
-chat_mediaTimeText={c('bg')}
-chat_mediaViews={plain('text')}
-chat_messageLinkIn={plain('link')}
-chat_messageLinkOut={plain('link')}
-chat_messagePanelBackground={c('panel')}
-chat_messagePanelCancelInlineBot={c('bg')}
-chat_messagePanelCursor={plain('accent')}
-chat_messagePanelHint={plain('subtext')}
-chat_messagePanelIcons={plain('text')}
-chat_messagePanelSend={plain('accent')}
-chat_messagePanelShadow={plain('accent')}
-chat_messagePanelText={plain('text')}
-chat_messagePanelVoiceBackground={plain('accent')}
-chat_messagePanelVoiceDelete={plain('text')}
-chat_messagePanelVoiceDuration={c('bg')}
-chat_messagePanelVoicePressed={plain('accent2')}
-chat_messageTextIn={plain('text')}
-chat_messageTextOut={plain('text')}
-chat_muteIcon={plain('subtext')}
-chat_outAdminSelectedText={plain('text')}
-chat_outAdminText={plain('subtext')}
-chat_outAudioCacheSeekbar={plain('subtext')}
-chat_outAudioDurationSelectedText={plain('text')}
-chat_outAudioDurationText={plain('subtext')}
-chat_outAudioPerfomerSelectedText={plain('text')}
-chat_outAudioPerfomerText={plain('subtext')}
-chat_outAudioProgress={plain('accent')}
-chat_outAudioSeekbar={plain('seek_bg')}
-chat_outAudioSeekbarFill={plain('seek_fill')}
-chat_outAudioSeekbarSelected={plain('seek_fill')}
-chat_outAudioSelectedProgress={plain('accent')}
-chat_outAudioTitleText={plain('text')}
-chat_outBubble={solid('out_bubble')}
-noGradient={plain('accent')}
-noGradient2={plain('accent2')}
-noGradient3={plain('accent3')}
-chat_outBubbleGradientAnimated={plain('accent')}
-chat_outBubbleGradientSelectedOverlay={plain('accent')}
-chat_outBubbleSelected={dsel}
-chat_outBubbleShadow=#00000000
-chat_outContactBackground={c('panel')}
-chat_outContactIcon={plain('text')}
-chat_outContactNameText={plain('text')}
-chat_outContactPhoneSelectedText={plain('text')}
-chat_outContactPhoneText={plain('subtext')}
-chat_outFileBackground={c('panel')}
-chat_outFileBackgroundSelected={plain('accent')}
-chat_outFileInfoSelectedText={plain('text')}
-chat_outFileInfoText={plain('subtext')}
-chat_outFileNameText={plain('text')}
-chat_outFileProgress={plain('accent')}
-chat_outFileProgressSelected={plain('accent2')}
-chat_outForwardedNameText={plain('text')}
-chat_outInstant={plain('text')}
-chat_outInstantSelected={plain('text')}
-chat_outLinkSelectBackground={c('accent', '44')}
-chat_outLoader={plain('text')}
-chat_outLoaderSelected={plain('text')}
-chat_outLocationIcon={plain('text')}
-chat_outMediaIcon={plain('accent')}
-chat_outMediaIconSelected={plain('accent')}
-chat_outMenu={plain('text')}
-chat_outMenuSelected={plain('text')}
-chat_outPollCorrectAnswer={plain('accent')}
-chat_outPollWrongAnswer={plain('text')}
-chat_outPreviewInstantText={plain('text')}
-chat_outPreviewLine={plain('accent')}
-chat_outPsaNameText={plain('text')}
-chat_outReactionButtonBackground={c('accent', '88')}
-chat_outReactionButtonText={plain('text')}
-chat_outReactionButtonTextSelected={plain('text')}
-chat_outReplyLine={plain('reply_line')}
-chat_outReplyMediaMessageSelectedText={plain('subtext')}
-chat_outReplyMediaMessageText={plain('subtext')}
-chat_outReplyMessageText={plain('subtext')}
-chat_outReplyNameText={plain('text')}
-chat_outSentCheck={plain('text')}
-chat_outSentCheckRead={plain('text')}
-chat_outSentCheckReadSelected={plain('text')}
-chat_outSentCheckSelected={plain('text')}
-chat_outSentClock={plain('subtext')}
-chat_outSentClockSelected={plain('subtext')}
-chat_outSiteNameText={plain('text')}
-chat_outTextSelectionCursor={plain('text')}
-chat_outTextSelectionHighlight={c('accent', '44')}
-chat_outTimeSelectedText={plain('subtext')}
-chat_outTimeText={plain('subtext')}
-chat_outUpCall={plain('text')}
-chat_outVenueInfoSelectedText={plain('text')}
-chat_outVenueInfoText={plain('subtext')}
-chat_outViaBotNameText={plain('text')}
-chat_outViews={plain('subtext')}
-chat_outViewsSelected={plain('subtext')}
-chat_outVoiceSeekbar={plain('seek_bg')}
-chat_outVoiceSeekbarFill={plain('seek_fill')}
-chat_outVoiceSeekbarSelected={plain('seek_fill')}
-chat_previewDurationText={c('bg')}
-chat_previewGameText={c('bg')}
-chat_recordedVoiceBackground={plain('accent')}
-chat_recordedVoiceDarkerBackground={plain('accent2')}
-chat_recordedVoiceDot={plain('text')}
-chat_recordedVoicePlayPause={c('bg')}
-chat_recordedVoiceProgress={plain('accent')}
-chat_recordedVoiceProgressInner={c('bg')}
-chat_recordTime={plain('text')}
-chat_recordVoiceCancel={plain('text')}
-chat_replyPanelClose={plain('text')}
-chat_replyPanelIcons={plain('accent')}
-chat_replyPanelLine={plain('accent')}
-chat_replyPanelName={plain('accent')}
-chat_searchPanelIcons={plain('text')}
-chat_searchPanelText={plain('text')}
-chat_secretChatStatusText={plain('text')}
-chat_secretTimeText={plain('text')}
-chat_selectedBackground={c('accent', '55')}
-chat_sentError={plain('text')}
-chat_sentErrorIcon={c('bg')}
-chat_serviceBackground={c('bg', '88')}
-chat_serviceBackgroundSelected={plain('accent')}
-chat_serviceBackgroundSelector={plain('accent')}
-chat_serviceIcon={plain('text')}
-chat_serviceLink={plain('accent')}
-chat_serviceText={plain('text')}
-chat_status={plain('accent')}
-chat_stickerNameText={c('bg')}
-chat_stickerReplyLine={plain('accent')}
-chat_stickerReplyMessageText={plain('text')}
-chat_stickerReplyNameText={plain('accent')}
-chat_stickerViaBotNameText={c('bg')}
-chat_stickersHintPanel={c('panel')}
-chat_textSelectBackground={c('accent', '55')}
-chat_TextSelectionCursor={plain('text')}
-chat_topPanelBackground={plain('bg')}
-chat_topPanelClose={plain('text')}
-chat_topPanelLine={plain('accent')}
-chat_topPanelMessage={plain('text')}
-chat_topPanelTitle={plain('accent')}
-chat_unreadMessagesStartArrowIcon={plain('text')}
-chat_unreadMessagesStartBackground={plain('accent')}
-chat_unreadMessagesStartText={c('bg')}
-checkbox={plain('accent')}
-checkboxCheck={c('bg')}
-checkboxDisabled={plain('subtext')}
-checkboxSquareBackground={plain('accent')}
-checkboxSquareCheck={c('bg')}
-checkboxSquareDisabled={plain('subtext')}
-checkboxSquareUnchecked={plain('text')}
-color_blue={plain('accent')}
-color_green={plain('accent3')}
-color_lightblue={plain('accent2')}
-color_lightgreen={plain('accent3')}
-color_orange={plain('accent')}
-color_purple={plain('accent2')}
-color_red={plain('text')}
-color_yellow={plain('accent')}
-contacts_inviteBackground={plain('accent')}
-contacts_inviteText={c('bg')}
-contextProgressInner1={plain('accent')}
-contextProgressInner2={plain('accent2')}
-contextProgressInner3={plain('accent3')}
-contextProgressInner4={plain('accent')}
-contextProgressOuter1={plain('accent')}
-contextProgressOuter2={plain('accent2')}
-contextProgressOuter3={plain('accent3')}
-contextProgressOuter4={plain('accent')}
-dialogBackground={solid('solid')}
-dialogBackgroundGray={solid('solid')}
-dialogButton={plain('accent')}
-dialogButtonSelector={plain('accent')}
-dialogCardShadow=#00000000
-dialogCameraIcon={c('bg')}
-dialogCheckboxSquareBackground={plain('accent')}
-dialogCheckboxSquareCheck={c('bg')}
-dialogCheckboxSquareDisabled={plain('subtext')}
-dialogCheckboxSquareUnchecked={plain('text')}
-dialogEmptyImage={plain('text')}
-dialogEmptyText={plain('text')}
-dialogFloatingButton={plain('accent')}
-dialogFloatingButtonPressed={plain('accent2')}
-dialogFloatingIcon={c('bg')}
-dialogGiftsBackground={plain('accent')}
-dialogGiftsTabText={plain('text')}
-dialogGrayLine={plain('divider')}
-dialogIcon={plain('text')}
-dialogInputField={plain('text')}
-dialogInputFieldActivated={plain('accent')}
-dialogLineProgress={plain('accent')}
-dialogLineProgressBackground={plain('seek_bg')}
-dialogLinkSelection={c('accent', '44')}
-dialogRadioBackground={plain('text')}
-dialogRadioBackgroundChecked={plain('accent')}
-dialogReactionMentionBackground={plain('accent')}
-dialogRoundCheckBox={plain('accent')}
-dialogRoundCheckBoxCheck={c('bg')}
-dialogScrollGlow={c('bg')}
-dialogSearchBackground={c('panel')}
-dialogSearchHint={plain('subtext')}
-dialogSearchIcon={plain('text')}
-dialogSearchText={plain('text')}
-dialogShadowLine={plain('divider')}
-dialogSwipeRemove={plain('text')}
-dialogTextBlack={plain('text')}
-dialogTextBlue={plain('accent')}
-dialogTextBlue2={plain('accent2')}
-dialogTextBlue4={plain('accent')}
-dialogTextGray={plain('accent')}
-dialogTextGray2={plain('subtext')}
-dialogTextGray3={plain('subtext')}
-dialogTextGray4={plain('subtext')}
-dialogTextHint={plain('subtext')}
-dialogTextLink={plain('link')}
-dialogTopBackground={plain('accent')}
-dialog_inlineProgress={plain('accent')}
-dialog_inlineProgressBackground={plain('text')}
-dialog_liveLocationProgress={plain('accent')}
-divider={c('divider', '66')}
-emptyListPlaceholder={plain('subtext')}
-fastScrollActive={plain('accent')}
-fastScrollInactive={plain('subtext')}
-fastScrollText={c('bg')}
-featuredStickers_addButton={plain('accent')}
-featuredStickers_addButtonPressed={plain('accent2')}
-featuredStickers_addedIcon={plain('accent')}
-featuredStickers_buttonProgress={plain('accent')}
-featuredStickers_buttonText={c('bg')}
-featuredStickers_removeButtonText={plain('text')}
-featuredStickers_unread={plain('accent')}
-files_folderIcon={plain('text')}
-files_folderIconBackground={plain('accent')}
-files_iconText={plain('text')}
-fill_RedNormal={plain('text')}
-fill_RedDark={plain('text')}
-gift_ribbon={plain('accent')}
-gift_ribbon_soldout={plain('accent2')}
-graySection={plain('subtext')}
-groupcreate_cursor={plain('accent')}
-groupcreate_hintText={plain('subtext')}
-groupcreate_sectionShadow={plain('accent')}
-groupcreate_sectionText={plain('text')}
-groupcreate_spanBackground={c('panel')}
-groupcreate_spanDelete={plain('accent')}
-groupcreate_spanText={plain('text')}
-inappPlayerBackground={solid('solid')}
-inappPlayerClose={plain('text')}
-inappPlayerPerformer={plain('subtext')}
-inappPlayerPlayPause={plain('accent')}
-inappPlayerTitle={plain('text')}
-iv_ab_progress={plain('accent')}
-iv_background=#00000000
-iv_backgroundGray=#00000000
-iv_navigationBackground=#00000000
-key_chat_messagePanelVoiceLock={plain('text')}
-key_chat_messagePanelVoiceLockBackground={plain('accent')}
-key_chat_messagePanelVoiceLockShadow=#00000000
-key_graySectionText={plain('text')}
-key_player_progressCachedBackground={plain('subtext')}
-key_sheet_other={plain('text')}
-key_sheet_scrollUp={plain('accent')}
-listSelectorSDK21={c('bg', '88')}
-location_actionActiveIcon={plain('accent')}
-location_actionBackground={plain('accent')}
-location_actionIcon={plain('text')}
-location_actionPressedBackground={plain('accent2')}
-location_liveLocationProgress={plain('accent')}
-location_placeLocationBackground={plain('accent')}
-location_sendLiveLocationBackground={plain('accent')}
-location_sendLiveLocationIcon={c('bg')}
-location_sendLiveLocationText={c('bg')}
-location_sendLocationBackground={plain('accent')}
-location_sendLocationIcon={c('bg')}
-location_sendLocationText={c('bg')}
-login_progressInner={plain('accent')}
-login_progressOuter={plain('accent2')}
-passport_authorizeBackground={plain('accent')}
-passport_authorizeBackgroundSelected={plain('accent2')}
-passport_authorizeText={c('bg')}
-picker_badge={plain('accent')}
-picker_badgeText={c('bg')}
-picker_disabledButton={plain('subtext')}
-picker_enabledButton={plain('accent')}
-player_actionBarItems={plain('text')}
-player_actionBarSelector={plain('accent')}
-player_actionBarSubtitle={plain('subtext')}
-player_actionBarTitle={plain('text')}
-player_background={solid('solid')}
-player_button={plain('text')}
-player_buttonActive={plain('accent')}
-player_progress={plain('accent')}
-player_progressBackground={c('bg')}
-player_time={plain('text')}
-premiumCoinGradient1={plain('accent')}
-premiumCoinGradient2={plain('accent2')}
-premiumGradient0={plain('accent')}
-premiumGradient1={plain('accent')}
-premiumGradient2={plain('accent2')}
-premiumGradient3={plain('accent3')}
-premiumGradient4={plain('accent')}
-premiumGradientBackground1={plain('accent')}
-premiumGradientBackground2={plain('accent2')}
-premiumGradientBackground3={plain('accent3')}
-premiumGradientBackground4={plain('accent')}
-premiumGradientBackgroundOverlay={plain('accent')}
-premiumGradientBottomSheet1={plain('accent')}
-premiumGradientBottomSheet2={plain('accent2')}
-premiumGradientBottomSheet3={plain('accent3')}
-premiumStarGradient1={plain('accent')}
-premiumStarGradient2={plain('accent2')}
-premiumStartSmallStarsColor={plain('accent')}
-premiumStartSmallStarsColor2={plain('accent2')}
-profile_actionBackground={plain('accent')}
-profile_actionIcon={c('bg')}
-profile_actionPressedBackground={plain('accent2')}
-profile_creatorIcon={plain('accent')}
-profile_status={plain('accent')}
-profile_tabSelectedLine={plain('accent')}
-profile_tabSelectedText={plain('accent')}
-profile_tabSelector={plain('accent')}
-profile_tabText={plain('subtext')}
-profile_title={plain('text')}
-profile_verifiedBackground={plain('accent')}
-profile_verifiedCheck={c('bg')}
-progressCircle={plain('accent')}
-radioBackground={plain('text')}
-radioBackgroundChecked={plain('accent')}
-reactionStarSelector={plain('accent')}
-returnToCallBackground={plain('accent')}
-returnToCallMutedBackground={plain('accent2')}
-returnToCallText={c('bg')}
-sessions_devicesImage={plain('text')}
-sharedMedia_linkPlaceholder={c('panel')}
-sharedMedia_linkPlaceholderText={plain('text')}
-sharedMedia_photoPlaceholder={c('panel')}
-sharedMedia_startStopLoadIcon={plain('accent')}
-statisticChartActiveLine={plain('accent')}
-statisticChartActivePickerChart={plain('accent')}
-statisticChartLineEmpty={plain('subtext')}
-statisticChartLine_blue={plain('accent')}
-statisticChartLine_cyan={plain('accent2')}
-statisticChartLine_golden={plain('accent')}
-statisticChartLine_green={plain('accent3')}
-statisticChartLine_indigo={plain('accent2')}
-statisticChartLine_lightblue={plain('accent')}
-statisticChartLine_lightgreen={plain('accent3')}
-statisticChartLine_orange={plain('accent')}
-statisticChartLine_purple={plain('accent2')}
-statisticChartLine_red={plain('accent3')}
-statisticChartRipple={plain('accent')}
-statisticChartSignature={plain('accent')}
-statisticChartSignatureAlpha={plain('accent')}
-stickers_menu={plain('text')}
-stickers_menuSelector={plain('text')}
-stories_circle_closeFriends1={plain('accent')}
-stories_circle_closeFriends2={plain('accent2')}
-stories_circle_dialog1={plain('accent')}
-stories_circle_dialog2={plain('accent2')}
-stories_circle1={plain('accent')}
-stories_circle2={plain('accent2')}
-switch2Track={plain('subtext')}
-switch2TrackChecked={plain('accent')}
-switchTrack={plain('subtext')}
-switchTrackBlue={plain('accent')}
-switchTrackBlueChecked={plain('accent')}
-switchTrackBlueSelector={plain('accent')}
-switchTrackBlueSelectorChecked={plain('accent')}
-switchTrackBlueThumb={plain('accent')}
-switchTrackBlueThumbChecked={plain('accent')}
-switchTrackChecked={plain('accent')}
-table_background={plain('accent')}
-table_border={plain('text')}
-text_RedBold={plain('text')}
-text_RedRegular={plain('text')}
-topics_unreadCounter={plain('accent')}
-topics_unreadCounterMuted={plain('accent2')}
-undo_background={c('bg', '88')}
-undo_cancelColor={plain('text')}
-undo_infoColor={plain('text')}
-voipgroup_actionBar={plain('accent')}
-voipgroup_actionBarItems={plain('text')}
-voipgroup_actionBarItemsSelector={plain('accent')}
-voipgroup_actionBarUnscrolled={plain('accent')}
-voipgroup_checkMenu={plain('accent')}
-voipgroup_connectingProgress={plain('accent')}
-voipgroup_dialogBackground={plain('accent')}
-voipgroup_disabledButton={plain('accent')}
-voipgroup_disabledButtonActive={plain('accent')}
-voipgroup_disabledButtonActiveScrolled={plain('accent')}
-voipgroup_inviteMembersBackground={plain('accent')}
-voipgroup_lastSeenText={plain('text')}
-voipgroup_lastSeenTextUnscrolled={plain('text')}
-voipgroup_leaveButton={plain('accent')}
-voipgroup_leaveButtonScrolled={plain('accent')}
-voipgroup_leaveCallMenu={plain('accent')}
-voipgroup_listeningText={plain('text')}
-voipgroup_listSelector={plain('accent')}
-voipgroup_listViewBackground={plain('accent')}
-voipgroup_listViewBackgroundUnscrolled={plain('accent')}
-voipgroup_muteButton={plain('accent')}
-voipgroup_muteButton2={plain('accent2')}
-voipgroup_muteButton3={plain('accent3')}
-voipgroup_mutedByAdminGradient={plain('accent')}
-voipgroup_mutedByAdminGradient2={plain('accent2')}
-voipgroup_mutedByAdminGradient3={plain('accent3')}
-voipgroup_mutedByAdminIcon={plain('text')}
-voipgroup_mutedByAdminMuteButton={plain('accent')}
-voipgroup_mutedByAdminMuteButtonDisabled={plain('accent')}
-voipgroup_mutedIcon={plain('text')}
-voipgroup_mutedIconUnscrolled={plain('text')}
-voipgroup_nameText={plain('text')}
-voipgroup_overlayAlertGradientMuted={plain('accent')}
-voipgroup_overlayAlertGradientMuted2={plain('accent2')}
-voipgroup_overlayAlertGradientUnmuted={plain('accent')}
-voipgroup_overlayAlertGradientUnmuted2={plain('accent2')}
-voipgroup_overlayAlertMutedByAdmin={plain('accent')}
-voipgroup_overlayAlertMutedByAdmin2={plain('accent2')}
-voipgroup_overlayBlue1={plain('accent')}
-voipgroup_overlayBlue2={plain('accent2')}
-voipgroup_overlayGreen1={plain('accent3')}
-voipgroup_overlayGreen2={plain('accent')}
-voipgroup_rtmpButton={plain('accent')}
-voipgroup_scrollUp={plain('accent')}
-voipgroup_searchBackground={plain('accent')}
-voipgroup_searchPlaceholder={plain('subtext')}
-voipgroup_searchText={plain('text')}
-voipgroup_soundButton={plain('accent')}
-voipgroup_soundButton2={plain('accent2')}
-voipgroup_soundButtonActive={plain('accent')}
-voipgroup_soundButtonActive2={plain('accent2')}
-voipgroup_soundButtonActive2Scrolled={plain('accent2')}
-voipgroup_soundButtonActiveScrolled={plain('accent')}
-voipgroup_speakingText={plain('text')}
-voipgroup_topPanelBlue1={plain('accent')}
-voipgroup_topPanelBlue2={plain('accent2')}
-voipgroup_topPanelGray={plain('accent')}
-voipgroup_topPanelGreen1={plain('accent3')}
-voipgroup_topPanelGreen2={plain('accent')}
-voipgroup_unmuteButton={plain('accent')}
-voipgroup_unmuteButton2={plain('accent2')}
-voipgroup_windowBackgroundWhiteInputField={plain('accent')}
-voipgroup_windowBackgroundWhiteInputFieldActivated={plain('accent')}
-windowBackgroundChecked={plain('accent')}
-windowBackgroundCheckText={c('bg')}
-windowBackgroundGray={c('bg')}
-windowBackgroundGrayShadow=#00000000
-windowBackgroundUnchecked={plain('text')}
-windowBackgroundWhite={c('bg')}
-windowBackgroundWhiteBlackText={plain('text')}
-windowBackgroundWhiteBlueButton={plain('accent')}
-windowBackgroundWhiteBlueHeader={plain('accent')}
-windowBackgroundWhiteBlueIcon={plain('accent')}
-windowBackgroundWhiteBlueText={plain('accent')}
-windowBackgroundWhiteBlueText2={plain('accent2')}
-windowBackgroundWhiteBlueText3={plain('accent')}
-windowBackgroundWhiteBlueText4={plain('accent')}
-windowBackgroundWhiteBlueText5={plain('accent')}
-windowBackgroundWhiteBlueText6={plain('accent')}
-windowBackgroundWhiteBlueText7={plain('accent')}
-windowBackgroundWhiteGrayIcon={plain('subtext')}
-windowBackgroundWhiteGrayText={plain('subtext')}
-windowBackgroundWhiteGrayText2={plain('subtext')}
-windowBackgroundWhiteGrayText3={plain('subtext')}
-windowBackgroundWhiteGrayText4={plain('subtext')}
-windowBackgroundWhiteGrayText5={plain('subtext')}
-windowBackgroundWhiteGrayText6={plain('subtext')}
-windowBackgroundWhiteGrayText7={plain('subtext')}
-windowBackgroundWhiteGrayText8={plain('subtext')}
-windowBackgroundWhiteGreenText={plain('accent3')}
-windowBackgroundWhiteGreenText2={plain('accent3')}
-windowBackgroundWhiteHintText={plain('subtext')}
-windowBackgroundWhiteInputField={plain('text')}
-windowBackgroundWhiteInputFieldActivated={plain('accent')}
-windowBackgroundWhiteLinkSelection={c('accent', '44')}
-windowBackgroundWhiteLinkText={plain('link')}
-windowBackgroundWhiteValueText={plain('accent')}
-chat_wallpaper=#00000000
-chat_wallpaper_gradient_to=#00000000
-key_chat_wallpaper_gradient_to2=#00000000
-key_chat_wallpaper_gradient_to3=#00000000
-dialogTextRed={plain('text')}
-dialogTextRed2={plain('text')}
-dialogTextBlue3={plain('accent')}
-dialogInputFieldText={plain('text')}
-dialogBadgeBackground={plain('accent')}
-dialogBadgeText={c('bg')}
-windowBackgroundWhiteRadius={c('bg')}
-windowBackgroundWhiteRedText={plain('text')}
-windowBackgroundWhiteRedText2={plain('text')}
-windowBackgroundWhiteRedText3={plain('text')}
-windowBackgroundWhiteRedText4={plain('text')}
-windowBackgroundWhiteRedText5={plain('text')}
-windowBackgroundWhiteRedText6={plain('text')}
-windowBackgroundWhiteGrayLine={plain('divider')}
-windowBackgroundGrayLine={plain('divider')}
-profile_adminIcon={plain('accent')}
-switchThumb={plain('text')}
-switchThumbChecked={plain('accent')}
-chat_inReplyBackground=#{p['reply_bg']}
-chat_outReplyBackground=#{p['reply_bg']}
-"""
-        return theme
-
-    def _process_photo(self, photo_bytes: bytes, alpha_hex: str = "e6"):
-        """Основная функция — умный расчёт цветов для каждой детали"""
-        img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-
-        # 1. Извлекаем богатую палитру
-        colors = self._extract_palette(img, count=12)
-
-        # 2. Строим умную палитру для всех элементов
-        palette = self._build_smart_palette(colors)
-
-        # 3. Собираем тему
-        theme = self._build_theme(palette, alpha_hex)
-
-        # 4. Обои
+    def _process_photo(self, photo_bytes, alpha_hex="e6", force=None, grad=False):
+        img = self._open_image(photo_bytes)
+        colors = _extract_palette(img)
+        roles, meta = _build_palette(colors, force, grad)
+        theme, keys = _render_theme(roles, alpha_hex, grad)
         wallpaper = self._theme_wallpaper(img)
+        meta["keys"] = keys
+        data = theme.encode("utf-8") + b"\n\nWPS\n" + wallpaper + b"\nWPE\n"
+        return data, meta
 
-        return (
-            theme.encode("utf-8")
-            + b"\n\nWPS\n"
-            + wallpaper
-            + b"\nWPE\n"
-        ), palette["is_dark"], palette["palette_size"]
-
-    @loader.command(ru_doc="- Создать умную тг-тему по фото (каждая деталь со своим цветом)")
+    @loader.command(
+        ru_doc="[прозрачность 0-100] [dark|light] [grad] — тг-тема по фото (все цвета фото, каждая деталь раскрашена)"
+    )
     async def android(self, message):
-        """- Create smart tg-theme from a photo (every element gets its own calculated color)"""
+        """[transparency 0-100] [dark|light] [grad] — tg-theme from a photo (all photo colors used, every element colored)"""
         reply = await message.get_reply_message()
         if not reply:
             return await utils.answer(message, self.strings["no_photo"])
@@ -1048,31 +1237,39 @@ chat_outReplyBackground=#{p['reply_bg']}
         try:
             photo_bytes = await self._client.download_file(photo, bytes)
 
-            args = utils.get_args_raw(message)
-            transparency = 90
-            if args and args.strip().isdigit():
-                transparency = max(0, min(100, int(args.strip())))
-            alpha = f"{int(transparency / 100 * 255):02x}"
+            transparency, force, grad = 90, None, False
+            for a in (utils.get_args_raw(message) or "").lower().split():
+                if a.isdigit():
+                    transparency = max(0, min(100, int(a)))
+                elif a in ("dark", "d", "тёмная", "темная", "тем"):
+                    force = "dark"
+                elif a in ("light", "l", "светлая", "свет"):
+                    force = "light"
+                elif a in ("grad", "gradient", "град"):
+                    grad = True
+            alpha = "%02x" % int(transparency / 100 * 255)
 
-            # УМНАЯ ОБРАБОТКА
-            theme_bytes, is_dark, color_count = self._process_photo(photo_bytes, alpha)
+            loop = asyncio.get_running_loop()
+            theme_bytes, meta = await loop.run_in_executor(
+                None, self._process_photo, photo_bytes, alpha, force, grad
+            )
 
             file = io.BytesIO(theme_bytes)
-            file.name = f"tgtheme_{'dark' if is_dark else 'light'}_smart.attheme"
+            file.name = "tgtheme_%s.attheme" % ("dark" if meta["is_dark"] else "light")
 
+            swatches = " ".join("<code>%s</code>" % c for c in meta["accents"])
             await utils.answer(
                 message,
                 self.strings["done"].format(
-                    "🌙 Тёмная" if is_dark else "☀️ Светлая",
+                    self.strings["dark"] if meta["is_dark"] else self.strings["light"],
                     transparency,
-                    "БЕЛЫЙ" if is_dark else "ЧЁРНЫЙ",
-                    color_count
+                    meta["colors"],
+                    swatches,
+                    meta["keys"],
                 ),
                 file=file,
             )
 
         except Exception as e:
-            logger.error(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("TgTheme error")
             await utils.answer(message, self.strings["error"].format(str(e)))
