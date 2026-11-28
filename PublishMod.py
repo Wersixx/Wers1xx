@@ -65,21 +65,27 @@ class PublishMod(loader.Module):
                 validator=loader.validators.String(),
             ),
             loader.ConfigValue(
+                "bot_token",
+                "",
+                "Токен бота (Bot API) для настоящих Rich Messages. Бот должен быть админом канала.",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
                 "media_url",
                 "https://x0.at/3Wu7.jpg",
-                "Ссылка на медиа для публикации",
+                "Ссылка на медиа для публикации (fallback, если нет banner в модуле)",
                 validator=loader.validators.String(),
             ),
             loader.ConfigValue(
                 "quote_media",
                 True,
-                "Использовать quote_media",
+                "Использовать quote_media (только userbot-режим)",
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
                 "invert_media",
                 True,
-                "Использовать invert_media",
+                "Использовать invert_media (только userbot-режим)",
                 validator=loader.validators.Boolean(),
             ),
         )
@@ -177,49 +183,63 @@ class PublishMod(loader.Module):
             github_link = self.config["github_raw_link"].rstrip('/') + '/' + module_name + '.py'
             dlm_command = f"dlm {github_link}"
             
-            if file_existed:
-                text = self._format_update_message(module_name, update_description)
-            else:
-                text = self._format_message(module_info, module_name)
-            
-            # Получаем чат для публикации
-            channel = self.config["channel"]
-            try:
-                entity = await message.client.get_entity(channel)
-            except Exception:
-                await utils.answer(message, f"<emoji document_id=5121063440311386962>👎</emoji> <b>Не удалось найти канал {channel}!</b>")
-                return
-            
-            # Подготавливаем медиа: сначала пробуем banner из meta модуля, иначе из конфига
+            # Баннер: сначала из meta модуля, иначе из конфига
             media_url = module_info.get("banner") or self.config["media_url"]
-            banner = None
             
-            if media_url and self.config["quote_media"]:
-                banner = InputMediaWebPage(media_url, optional=True)
-            elif media_url:
-                banner = media_url
+            bot_token = (self.config["bot_token"] or "").strip()
             
-            # Кнопка "Установить" — копирует готовую команду dlm
-            install_button = KeyboardButtonCopy(
-                text="📥 Установить",
-                copy_text=dlm_command
-            )
-            buttons = [[install_button]]
-            
-            # Отправляем сразу готовый пост (так кнопка и медиа работают надёжнее)
-            try:
-                await message.client.send_message(
-                    entity,
-                    text,
-                    parse_mode="html",
-                    file=banner,
-                    invert_media=self.config["invert_media"],
-                    buttons=buttons,
-                    link_preview=False,
+            if bot_token:
+                # === Настоящий Rich Message через Bot API ===
+                if file_existed:
+                    rich_html = self._format_update_message_rich(
+                        module_name, update_description, dlm_command, media_url
+                    )
+                else:
+                    rich_html = self._format_message_rich(
+                        module_info, module_name, dlm_command, media_url
+                    )
+                
+                send_result = await self._send_rich_via_bot(
+                    bot_token, self.config["channel"], rich_html
                 )
-            except Exception as e:
-                logger.error(f"Failed to send with media/buttons: {e}")
-                # Фолбек 1 — с медиа, без кнопок
+                
+                if not send_result.get("ok"):
+                    await utils.answer(
+                        message,
+                        f"<emoji document_id=5121063440311386962>👎</emoji> <b>Ошибка Bot API:</b>\n"
+                        f"<code>{send_result.get('description', send_result)}</code>"
+                    )
+                    return
+            else:
+                # === Fallback: userbot-режим (классический HTML + KeyboardButtonCopy) ===
+                if file_existed:
+                    text = self._format_update_message(module_name, update_description)
+                else:
+                    text = self._format_message(module_info, module_name)
+                
+                channel = self.config["channel"]
+                try:
+                    entity = await message.client.get_entity(channel)
+                except Exception:
+                    await utils.answer(
+                        message,
+                        f"<emoji document_id=5121063440311386962>👎</emoji> "
+                        f"<b>Не удалось найти канал {channel}!</b>"
+                    )
+                    return
+                
+                banner = None
+                if media_url and self.config["quote_media"]:
+                    banner = InputMediaWebPage(media_url, optional=True)
+                elif media_url:
+                    banner = media_url
+                
+                install_button = KeyboardButtonCopy(
+                    text="📥 Установить",
+                    copy_text=dlm_command
+                )
+                buttons = [[install_button]]
+                
                 try:
                     await message.client.send_message(
                         entity,
@@ -227,22 +247,41 @@ class PublishMod(loader.Module):
                         parse_mode="html",
                         file=banner,
                         invert_media=self.config["invert_media"],
+                        buttons=buttons,
                         link_preview=False,
                     )
-                except Exception as e2:
-                    logger.error(f"Failed to send with media: {e2}")
-                    # Фолбек 2 — просто текст
-                    await message.client.send_message(
-                        entity,
-                        text,
-                        parse_mode="html",
-                        link_preview=False,
-                    )
+                except Exception as e:
+                    logger.error(f"Failed to send with media/buttons: {e}")
+                    try:
+                        await message.client.send_message(
+                            entity,
+                            text,
+                            parse_mode="html",
+                            file=banner,
+                            invert_media=self.config["invert_media"],
+                            link_preview=False,
+                        )
+                    except Exception as e2:
+                        logger.error(f"Failed to send with media: {e2}")
+                        await message.client.send_message(
+                            entity,
+                            text,
+                            parse_mode="html",
+                            link_preview=False,
+                        )
             
             if file_existed:
-                await utils.answer(message, "<emoji document_id=5123163417326126159>✅</emoji> <b>Обновление модуля успешно опубликовано в канал!</b>")
+                await utils.answer(
+                    message,
+                    "<emoji document_id=5123163417326126159>✅</emoji> "
+                    "<b>Обновление модуля успешно опубликовано в канал!</b>"
+                )
             else:
-                await utils.answer(message, "<emoji document_id=5123163417326126159>✅</emoji> <b>Модуль успешно опубликован в канал!</b>")
+                await utils.answer(
+                    message,
+                    "<emoji document_id=5123163417326126159>✅</emoji> "
+                    "<b>Модуль успешно опубликован в канал!</b>"
+                )
             
         except Exception as e:
             logger.error(f"Error publishing module: {e}")
@@ -831,7 +870,7 @@ class PublishMod(loader.Module):
         return commands
 
     def _format_update_message(self, module_name: str, update_description: str) -> str:
-        """Форматирует сообщение об обновлении модуля (rich)"""
+        """Fallback (userbot) — обновление модуля"""
         clean_name = module_name or "Без названия"
         
         if len(update_description) > 500:
@@ -845,11 +884,10 @@ class PublishMod(loader.Module):
             f'</blockquote>\n\n'
             f'<emoji document_id=5253577054137362120>🔗</emoji> <i>Нажми кнопку ниже, чтобы скопировать команду установки</i>'
         )
-        
         return text
 
     def _format_message(self, module_info: dict, module_name: str) -> str:
-        """Форматирует сообщение для публикации нового модуля (rich)"""
+        """Fallback (userbot) — новый модуль"""
         clean_name = module_name or "Без названия"
         
         module_desc = module_info.get("description") or "Без описания"
@@ -891,8 +929,146 @@ class PublishMod(loader.Module):
         text += (
             f'\n<emoji document_id=5256094480498436162>📦</emoji> <i>Нажми кнопку ниже, чтобы скопировать команду установки</i>'
         )
-        
         return text
+
+    # ─────────────────────── True Rich Message (Bot API) ───────────────────────
+
+    def _format_update_message_rich(
+        self,
+        module_name: str,
+        update_description: str,
+        dlm_command: str,
+        media_url: str = None,
+    ) -> str:
+        """Настоящий Rich HTML для обновления модуля (Bot API sendRichMessage)"""
+        clean_name = module_name or "Без названия"
+        if len(update_description) > 800:
+            update_description = update_description[:797] + "..."
+
+        parts = []
+        parts.append(f"<h2>⚙️ Обновление модуля <code>{self._escape(clean_name)}</code></h2>")
+
+        if media_url:
+            parts.append(f'<img src="{self._escape(media_url)}"/>')
+
+        parts.append(
+            "<blockquote expandable>"
+            f"<b>📝 Что изменилось:</b><br/>"
+            f"{self._escape(update_description)}"
+            "</blockquote>"
+        )
+
+        parts.append(
+            '<tg-button-row align="center">'
+            f'<tg-button type="copy_text" text="{self._escape(dlm_command)}">'
+            "📥 Установить"
+            "</tg-button>"
+            "</tg-button-row>"
+        )
+
+        return "\n".join(parts)
+
+    def _format_message_rich(
+        self,
+        module_info: dict,
+        module_name: str,
+        dlm_command: str,
+        media_url: str = None,
+    ) -> str:
+        """Настоящий Rich HTML для нового модуля (Bot API sendRichMessage)"""
+        clean_name = module_name or "Без названия"
+        module_desc = module_info.get("description") or "Без описания"
+        if len(module_desc) > 300:
+            module_desc = module_desc[:297] + "..."
+
+        parts = []
+        parts.append(f"<h2>🌙 Модуль <code>{self._escape(clean_name)}</code></h2>")
+        parts.append(f"<p>📝 {self._escape(module_desc)}</p>")
+
+        if media_url:
+            parts.append(f'<img src="{self._escape(media_url)}"/>')
+
+        # Команды — красивая таблица
+        commands = module_info.get("commands") or []
+        if commands:
+            sorted_commands = sorted(commands, key=lambda x: x["name"])
+            max_show = 8
+            rows = [
+                "<tr><th>Команда</th><th>Описание</th></tr>"
+            ]
+            for cmd in sorted_commands[:max_show]:
+                name = self._escape(cmd["name"])
+                desc = self._escape(cmd.get("description") or "—")
+                rows.append(f"<tr><td><code>.{name}</code></td><td>{desc}</td></tr>")
+
+            table = (
+                '<table bordered striped compact>'
+                "<caption>Команды модуля</caption>"
+                + "".join(rows)
+                + "</table>"
+            )
+            if len(sorted_commands) > max_show:
+                table += f"<p><i>…и ещё {len(sorted_commands) - max_show} команд</i></p>"
+
+            parts.append(table)
+        else:
+            parts.append(
+                "<blockquote>"
+                "📋 <b>Команды не обнаружены</b><br/>"
+                "<i>Возможно, модуль использует другой способ регистрации</i>"
+                "</blockquote>"
+            )
+
+        if module_info.get("meta_developer"):
+            devs = module_info["meta_developer"]
+            label = "Разработчики" if "," in devs else "Разработчик"
+            parts.append(f"<p>👨‍💻 <b>{label}:</b> {self._escape(devs)}</p>")
+
+        parts.append(
+            '<tg-button-row align="center">'
+            f'<tg-button type="copy_text" text="{self._escape(dlm_command)}">'
+            "📥 Установить"
+            "</tg-button>"
+            "</tg-button-row>"
+        )
+
+        return "\n".join(parts)
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Минимальный HTML-escape для Rich Message"""
+        if not text:
+            return ""
+        return (
+            str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    async def _send_rich_via_bot(self, bot_token: str, channel: str, html: str) -> dict:
+        """Отправляет настоящее Rich Message через Bot API sendRichMessage"""
+        url = f"https://api.telegram.org/bot{bot_token}/sendRichMessage"
+        payload = {
+            "chat_id": channel,
+            "rich_message": {
+                "html": html,
+            },
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    data = await resp.json()
+                    return data
+        except Exception as e:
+            return {"ok": False, "description": str(e)}
+
 
     async def pmdelcmd(self, message: Message):
         """<название модуля> - Удалить модуль из GitHub репозитория и full.txt"""
