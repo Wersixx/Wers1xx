@@ -940,27 +940,47 @@ class PublishMod(loader.Module):
         dlm_command: str,
         media_url: str = None,
     ) -> str:
-        """Настоящий Rich HTML для обновления модуля (Bot API sendRichMessage)"""
+        """Rich HTML: обновление — каждый блок в своём closed blockquote."""
         clean_name = module_name or "Без названия"
         if len(update_description) > 800:
             update_description = update_description[:797] + "..."
 
-        parts = []
-        parts.append(f"<h2>⚙️ Обновление модуля <code>{self._escape(clean_name)}</code></h2>")
+        parts: list[str] = []
 
         if media_url:
-            parts.append(f'<img src="{self._escape(media_url)}"/>')
+            parts.append(
+                f'<figure><img src="{self._escape(media_url)}"/>'
+                f"<figcaption>Обновление · {self._escape(clean_name)}</figcaption></figure>"
+            )
 
         parts.append(
-            "<blockquote expandable>"
-            f"<b>📝 Что изменилось:</b><br/>"
+            f"<h2>⚙️ Обновление · <code>{self._escape(clean_name)}</code></h2>"
+        )
+
+        parts.append(
+            "<blockquote>"
+            f"<b>📦 Модуль</b><br/>"
+            f"<code>{self._escape(clean_name)}</code>"
+            "</blockquote>"
+        )
+
+        parts.append(
+            "<blockquote>"
+            f"<b>📝 Что изменилось</b><br/>"
             f"{self._escape(update_description)}"
             "</blockquote>"
         )
 
         parts.append(
+            "<blockquote>"
+            f"<b>🔗 Установка</b><br/>"
+            f"<code>{self._escape(dlm_command)}</code>"
+            "</blockquote>"
+        )
+
+        parts.append(
             '<tg-button-row align="center">'
-            f'<tg-button type="copy_text" text="{self._escape(dlm_command)}">'
+            f'<tg-button type="copy_text" style="success" text="{self._escape(dlm_command)}">'
             "📥 Установить"
             "</tg-button>"
             "</tg-button-row>"
@@ -975,58 +995,84 @@ class PublishMod(loader.Module):
         dlm_command: str,
         media_url: str = None,
     ) -> str:
-        """Настоящий Rich HTML для нового модуля (Bot API sendRichMessage)"""
+        """Rich HTML: новый модуль — каждый элемент в своём closed blockquote."""
         clean_name = module_name or "Без названия"
         module_desc = module_info.get("description") or "Без описания"
-        if len(module_desc) > 300:
-            module_desc = module_desc[:297] + "..."
+        if len(module_desc) > 400:
+            module_desc = module_desc[:397] + "..."
 
-        parts = []
-        parts.append(f"<h2>🌙 Модуль <code>{self._escape(clean_name)}</code></h2>")
-        parts.append(f"<p>📝 {self._escape(module_desc)}</p>")
+        parts: list[str] = []
 
         if media_url:
-            parts.append(f'<img src="{self._escape(media_url)}"/>')
+            parts.append(
+                f'<figure><img src="{self._escape(media_url)}"/>'
+                f"<figcaption>{self._escape(clean_name)}</figcaption></figure>"
+            )
 
-        # Команды — красивая таблица
+        parts.append(f"<h2>🌙 {self._escape(clean_name)}</h2>")
+
+        parts.append(
+            "<blockquote>"
+            f"<b>📦 Модуль</b><br/>"
+            f"<code>{self._escape(clean_name)}</code>"
+            "</blockquote>"
+        )
+
+        parts.append(
+            "<blockquote>"
+            f"<b>📝 Описание</b><br/>"
+            f"{self._escape(module_desc)}"
+            "</blockquote>"
+        )
+
         commands = module_info.get("commands") or []
         if commands:
             sorted_commands = sorted(commands, key=lambda x: x["name"])
-            max_show = 8
-            rows = [
-                "<tr><th>Команда</th><th>Описание</th></tr>"
-            ]
+            max_show = 10
+            lines = []
             for cmd in sorted_commands[:max_show]:
                 name = self._escape(cmd["name"])
                 desc = self._escape(cmd.get("description") or "—")
-                rows.append(f"<tr><td><code>.{name}</code></td><td>{desc}</td></tr>")
-
-            table = (
-                '<table bordered striped compact>'
-                "<caption>Команды модуля</caption>"
-                + "".join(rows)
-                + "</table>"
-            )
+                lines.append(f"• <code>.{name}</code> — {desc}")
+            body = "<br/>".join(lines)
             if len(sorted_commands) > max_show:
-                table += f"<p><i>…и ещё {len(sorted_commands) - max_show} команд</i></p>"
-
-            parts.append(table)
+                body += (
+                    f"<br/><i>…и ещё {len(sorted_commands) - max_show} команд</i>"
+                )
+            parts.append(
+                "<blockquote>"
+                f"<b>📋 Команды · {len(sorted_commands)}</b><br/>"
+                f"{body}"
+                "</blockquote>"
+            )
         else:
             parts.append(
                 "<blockquote>"
-                "📋 <b>Команды не обнаружены</b><br/>"
-                "<i>Возможно, модуль использует другой способ регистрации</i>"
+                "<b>📋 Команды</b><br/>"
+                "<i>Не обнаружены — возможно, другой способ регистрации</i>"
                 "</blockquote>"
             )
 
         if module_info.get("meta_developer"):
             devs = module_info["meta_developer"]
             label = "Разработчики" if "," in devs else "Разработчик"
-            parts.append(f"<p>👨‍💻 <b>{label}:</b> {self._escape(devs)}</p>")
+            parts.append(
+                "<blockquote>"
+                f"<b>👨‍💻 {label}</b><br/>"
+                f"{self._escape(devs)}"
+                "</blockquote>"
+            )
+
+        parts.append(
+            "<blockquote>"
+            f"<b>🔗 Установка</b><br/>"
+            f"<code>{self._escape(dlm_command)}</code>"
+            "</blockquote>"
+        )
 
         parts.append(
             '<tg-button-row align="center">'
-            f'<tg-button type="copy_text" text="{self._escape(dlm_command)}">'
+            f'<tg-button type="copy_text" style="success" text="{self._escape(dlm_command)}">'
             "📥 Установить"
             "</tg-button>"
             "</tg-button-row>"
