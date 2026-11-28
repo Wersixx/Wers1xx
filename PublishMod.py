@@ -831,35 +831,32 @@ class PublishMod(loader.Module):
         return commands
 
     def _format_update_message(self, module_name: str, update_description: str) -> str:
-        """Форматирует сообщение об обновлении модуля (рич-формат)"""
+        """Форматирует сообщение об обновлении модуля (rich)"""
         clean_name = module_name or "Без названия"
         
-        # Ограничиваем длину описания обновления
         if len(update_description) > 500:
             update_description = update_description[:497] + "..."
         
         text = (
-            f'<blockquote>'
             f'<emoji document_id=5253952855185829086>⚙️</emoji> <b>Обновление модуля</b> <code>{clean_name}</code>\n\n'
+            f'<blockquote expandable>'
             f'<emoji document_id=5256230583717079814>📝</emoji> <b>Что изменилось:</b>\n'
-            f'{update_description}\n\n'
+            f'{update_description}'
+            f'</blockquote>\n\n'
             f'<emoji document_id=5253577054137362120>🔗</emoji> <i>Нажми кнопку ниже, чтобы скопировать команду установки</i>'
-            f'</blockquote>'
         )
         
         return text
 
     def _format_message(self, module_info: dict, module_name: str) -> str:
-        """Форматирует сообщение для публикации нового модуля (рич-формат)"""
+        """Форматирует сообщение для публикации нового модуля (rich)"""
         clean_name = module_name or "Без названия"
         
-        # Получаем описание модуля
         module_desc = module_info.get("description") or "Без описания"
         if len(module_desc) > 200:
             module_desc = module_desc[:197] + "..."
         
         text = (
-            f'<blockquote>'
             f'<emoji document_id=5253521692008917018>🌙</emoji> <b>Модуль</b> <code>{clean_name}</code>\n'
             f'<emoji document_id=5256230583717079814>📝</emoji> {module_desc}\n'
         )
@@ -867,24 +864,25 @@ class PublishMod(loader.Module):
         if module_info["commands"]:
             max_commands = 5
             total_commands = len(module_info["commands"])
-            
-            # Сортируем команды
             sorted_commands = sorted(module_info["commands"], key=lambda x: x["name"])
             
-            text += f'\n<emoji document_id=5197195523794157505>▫️</emoji> <b>Команды:</b>\n'
+            text += f'\n<blockquote expandable>'
+            text += f'<emoji document_id=5197195523794157505>▫️</emoji> <b>Команды:</b>\n'
             for cmd in sorted_commands[:max_commands]:
                 desc = cmd["description"] or "Без описания"
                 text += f'• <code>.{cmd["name"]}</code> — {desc}\n'
             
             if total_commands > max_commands:
-                text += f'\n<emoji document_id=6021435576513730578>📋</emoji> <i>И ещё {total_commands - max_commands} команд</i>\n'
+                text += f'\n<emoji document_id=6021435576513730578>📋</emoji> <i>И ещё {total_commands - max_commands} команд</i>'
+            text += f'</blockquote>\n'
         else:
             text += (
-                f'\n<emoji document_id=6021435576513730578>📋</emoji> <b>Команды не обнаружены</b>\n'
-                f'<i>Возможно, модуль использует другой способ регистрации</i>\n'
+                f'\n<blockquote>'
+                f'<emoji document_id=6021435576513730578>📋</emoji> <b>Команды не обнаружены</b>\n'
+                f'<i>Возможно, модуль использует другой способ регистрации</i>'
+                f'</blockquote>\n'
             )
         
-        # Добавляем информацию о разработчике(ах)
         if module_info.get("meta_developer"):
             devs = module_info["meta_developer"]
             label = "Разработчики" if "," in devs else "Разработчик"
@@ -892,10 +890,174 @@ class PublishMod(loader.Module):
         
         text += (
             f'\n<emoji document_id=5256094480498436162>📦</emoji> <i>Нажми кнопку ниже, чтобы скопировать команду установки</i>'
-            f'</blockquote>'
         )
         
         return text
+
+    async def pmdelcmd(self, message: Message):
+        """<название модуля> - Удалить модуль из GitHub репозитория и full.txt"""
+        args = utils.get_args_raw(message).strip()
+        
+        if not args:
+            await utils.answer(
+                message,
+                "<emoji document_id=5121063440311386962>👎</emoji> <b>Укажи название модуля!</b>\n"
+                "<code>.pmdel ModuleName</code>"
+            )
+            return
+        
+        module_name = args
+        # Убираем .py если пользователь указал
+        if module_name.endswith(".py"):
+            module_name = module_name[:-3]
+        
+        safe_name = re.sub(r'[^\w\-.]', '', module_name)
+        if not safe_name:
+            await utils.answer(message, "<emoji document_id=5121063440311386962>👎</emoji> <b>Некорректное имя модуля!</b>")
+            return
+        
+        filename = f"{safe_name}.py"
+        
+        await utils.answer(
+            message,
+            f"<emoji document_id=5253464392850221514>🔃</emoji> <b>Удаляю <code>{filename}</code> из GitHub...</b>"
+        )
+        
+        result = await self._delete_from_github(filename, safe_name)
+        
+        if result["success"]:
+            await utils.answer(
+                message,
+                f"<emoji document_id=5123163417326126159>✅</emoji> <b>Модуль <code>{safe_name}</code> успешно удалён!</b>\n"
+                f"• Файл: {result.get('file_action', 'удалён')}\n"
+                f"• full.txt: {result.get('full_action', 'обновлён')}"
+            )
+        else:
+            await utils.answer(
+                message,
+                f"<emoji document_id=5121063440311386962>👎</emoji> <b>Ошибка удаления:</b>\n<code>{result.get('error', 'Unknown')}</code>"
+            )
+
+    async def _delete_from_github(self, filename: str, module_name: str) -> dict:
+        """Удаляет файл модуля из репозитория и убирает его из full.txt"""
+        token = self.config["github_token"].strip()
+        repo = self.config["github_repo"].strip()
+        branch = self.config["github_branch"].strip() or "main"
+        
+        if not token:
+            return {"success": False, "error": "Не указан github_token в конфиге!"}
+        
+        if not repo or "/" not in repo:
+            return {"success": False, "error": "Неверный формат github_repo (нужно owner/repo)"}
+        
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "Hikka-PublishMod",
+        }
+        
+        file_action = "не найден"
+        full_action = "без изменений"
+        
+        async with aiohttp.ClientSession() as session:
+            # 1. Удаляем .py файл
+            api_file = f"https://api.github.com/repos/{repo}/contents/{filename}"
+            
+            try:
+                async with session.get(
+                    api_file,
+                    headers=headers,
+                    params={"ref": branch},
+                    timeout=aiohttp.ClientTimeout(total=20)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        sha = data.get("sha")
+                        
+                        if sha:
+                            payload = {
+                                "message": f"Delete module: {filename}",
+                                "sha": sha,
+                                "branch": branch,
+                            }
+                            async with session.delete(
+                                api_file,
+                                headers=headers,
+                                json=payload,
+                                timeout=aiohttp.ClientTimeout(total=30)
+                            ) as del_resp:
+                                if del_resp.status in (200, 201):
+                                    file_action = "удалён"
+                                else:
+                                    err = await del_resp.text()
+                                    return {"success": False, "error": f"Ошибка удаления файла ({del_resp.status}): {err[:200]}"}
+                    elif resp.status == 404:
+                        file_action = "уже отсутствовал"
+                    else:
+                        text = await resp.text()
+                        return {"success": False, "error": f"Ошибка проверки файла ({resp.status}): {text[:200]}"}
+            except Exception as e:
+                return {"success": False, "error": f"Ошибка сети при удалении файла: {e}"}
+            
+            # 2. Обновляем full.txt — убираем название модуля
+            full_txt_path = "full.txt"
+            api_full = f"https://api.github.com/repos/{repo}/contents/{full_txt_path}"
+            
+            try:
+                async with session.get(
+                    api_full,
+                    headers=headers,
+                    params={"ref": branch},
+                    timeout=aiohttp.ClientTimeout(total=20)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        sha = data.get("sha")
+                        content_b64 = data.get("content", "")
+                        
+                        if content_b64 and sha:
+                            current_content = base64.b64decode(content_b64).decode("utf-8")
+                            lines = [line.strip() for line in current_content.splitlines() if line.strip()]
+                            
+                            if module_name in lines:
+                                lines = [l for l in lines if l != module_name]
+                                lines = sorted(set(lines), key=str.lower)
+                                new_content = "\n".join(lines) + "\n" if lines else ""
+                                
+                                content_b64_new = base64.b64encode(new_content.encode("utf-8")).decode("utf-8")
+                                payload = {
+                                    "message": f"Remove {module_name} from full.txt",
+                                    "content": content_b64_new,
+                                    "sha": sha,
+                                    "branch": branch,
+                                }
+                                
+                                async with session.put(
+                                    api_full,
+                                    headers=headers,
+                                    json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=30)
+                                ) as put_resp:
+                                    if put_resp.status in (200, 201):
+                                        full_action = "обновлён (модуль удалён)"
+                                    else:
+                                        err = await put_resp.text()
+                                        logger.warning(f"full.txt update failed: {err[:200]}")
+                                        full_action = "ошибка обновления"
+                            else:
+                                full_action = "модуль не был в списке"
+                    elif resp.status == 404:
+                        full_action = "full.txt отсутствует"
+            except Exception as e:
+                logger.warning(f"Ошибка при обновлении full.txt: {e}")
+                full_action = f"ошибка: {e}"
+        
+        return {
+            "success": True,
+            "file_action": file_action,
+            "full_action": full_action,
+        }
 
     async def client_ready(self, client, db):
         self.client = client
