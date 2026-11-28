@@ -18,6 +18,7 @@ MediaLoader
 MediaToBanner
 MessageSticker
 PremiumEmojiInfo
+PublishMod
 ReadFiles
 StoryPoster
 TgTheme
